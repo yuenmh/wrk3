@@ -1,0 +1,17 @@
+[package]
+name = "wrk3"
+version = "0.1.0"
+edition = "2024"
+authors = ["Evan Jones (原文軒) <me@yuenmh.dev>"]
+license = "GPL-3.0-or-later"
+
+[dependencies]
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["derive"] }
+hyper = { version = "1.11.1", features = ["client", "http1"] }
+mlua = { version = "0.12.1", features = ["luajit", "vendored", "async"] }
+serde = { version = "1.0.229", features = ["serde_derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
