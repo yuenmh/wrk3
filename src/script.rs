@@ -1,26 +1,31 @@
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt::Debug,
     num::{ParseFloatError, ParseIntError},
     ops::Deref,
     rc::Rc,
     str::FromStr,
-    time::Duration,
+    time::{Duration, Instant, SystemTime},
 };
 
+use bytes::Bytes;
 use hyper::client::conn::http1;
 use mlua::{FromLua, IntoLua};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, de};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::script::Method::Get;
 
 macro_rules! impl_from_lua_table {
-    ($ty:ty, $($field:ident),* $(,)?) => {
+    ($ty:ty, $($field:ident,)* $([$default_field:ident = $f:expr],)*) => {
         impl mlua::FromLua for $ty {
             fn from_lua(value: mlua::Value, lua: &mlua::Lua) -> mlua::Result<Self> {
                 let table = mlua::Table::from_lua(value, lua)?;
                 Ok(Self {
                     $($field: table.get(stringify!($field))?,)*
+                    $($default_field: table.get(stringify!($default_field)).unwrap_or_else(|_| $f(lua)),)*
                 })
             }
         }
@@ -37,6 +42,15 @@ impl mlua::UserData for LuaDt {
         methods.add_meta_method(mlua::MetaMethod::ToString, |_, this, (): ()| {
             Ok(format!("{}", humantime::format_duration(this.duration)))
         });
+        methods.add_meta_method(mlua::MetaMethod::Sub, |_, this, rhs: LuaDt| {
+            Ok(LuaDt {
+                duration: this.duration - rhs.duration,
+            })
+        });
+        methods.add_meta_method(mlua::MetaMethod::Eq, |_, this, rhs: LuaDt| {
+            Ok(this.duration == rhs.duration)
+        });
+        methods.add_method("secs", |_, this, (): ()| Ok(this.duration.as_secs_f64()));
     }
 }
 
@@ -295,7 +309,7 @@ fn create_args_mod(lua: &mlua::Lua, state: ArgsState) -> mlua::Result<mlua::Valu
             struct Opts {
                 default: Option<$rust_ty>,
             }
-            impl_from_lua_table!(Opts, default);
+            impl_from_lua_table!(Opts, default,);
             m.set(
                 stringify!($name),
                 lua.create_function({
@@ -329,14 +343,150 @@ fn create_args_mod(lua: &mlua::Lua, state: ArgsState) -> mlua::Result<mlua::Valu
     m.into_lua(lua)
 }
 
+enum Method {
+    Get,
+    Post,
+    Put,
+    Delete,
+    Patch,
+}
+
+impl FromLua for Method {
+    fn from_lua(
+        value: mlua::prelude::LuaValue,
+        lua: &mlua::prelude::Lua,
+    ) -> mlua::prelude::LuaResult<Self> {
+        let value_s = String::from_lua(value, lua)?;
+        match value_s.to_lowercase().as_str() {
+            "get" => Ok(Method::Get),
+            "post" => Ok(Method::Post),
+            "put" => Ok(Method::Put),
+            "delete" => Ok(Method::Delete),
+            "patch" => Ok(Method::Patch),
+            _ => Err(mlua::Error::external("expected a valid HTTP method")),
+        }
+    }
+}
+
+struct Request {
+    path: String,
+    method: Method,
+    headers: Option<FxHashMap<String, String>>,
+    body: Option<String>,
+    timeout: Option<LuaDt>,
+}
+
+impl_from_lua_table!(
+    Request,
+    path,
+    [method = |_| Method::Get],
+    [headers = |_| None],
+    [body = |_| None],
+    [timeout = |_| None],
+);
+
+enum ResponseError {
+    TimedOut,
+    Disconnected,
+}
+
+struct Response {
+    status: u16,
+    error: Option<ResponseError>,
+}
+
+impl mlua::UserData for Response {}
+
+enum RuntimeMsg {
+    Request {
+        request: Request,
+        response: oneshot::Sender<Response>,
+    },
+    Sleep {
+        duration: Duration,
+        response: oneshot::Sender<()>,
+    },
+}
+
+#[derive(Clone)]
+struct RuntimeState {
+    sender: mpsc::Sender<RuntimeMsg>,
+}
+
+fn create_runtime_fns(lua: &mlua::Lua, m: &mlua::Table, state: RuntimeState) -> mlua::Result<()> {
+    m.set(
+        "request",
+        lua.create_async_function({
+            let state = state.clone();
+            move |_lua, request: Request| {
+                let state = state.clone();
+                async move {
+                    let (response, res) = oneshot::channel();
+                    state
+                        .sender
+                        .send(RuntimeMsg::Request { request, response })
+                        .await
+                        .map_err(|_| mlua::Error::external("not connected to runtime"))?;
+                    res.await
+                        .map_err(|_| mlua::Error::external("not connected to runtime"))
+                }
+            }
+        })?,
+    )?;
+
+    m.set(
+        "sleep",
+        lua.create_async_function({
+            let state = state.clone();
+            move |_lua, duration: LuaDt| {
+                let state = state.clone();
+                async move {
+                    let (response, res) = oneshot::channel();
+                    state
+                        .sender
+                        .send(RuntimeMsg::Sleep {
+                            duration: duration.duration,
+                            response,
+                        })
+                        .await
+                        .map_err(|_| mlua::Error::external("not connected to runtime"))?;
+                    res.await
+                        .map_err(|_| mlua::Error::external("not connected to runtime"))?;
+                    Ok(())
+                }
+            }
+        })?,
+    )?;
+
+    Ok(())
+}
+
 struct Wrk3State {
     args_state: ArgsState,
+    runtime_state: RuntimeState,
+    start_time: Rc<Cell<Instant>>,
 }
 
 fn create_wrk3_mod(lua: &mlua::Lua, state: Wrk3State) -> mlua::Result<mlua::Value> {
     let m = lua.create_table()?;
 
     m.set("args", create_args_mod(lua, state.args_state)?)?;
+
+    m.set("dt", lua.create_function(|_lua, dt: LuaDt| Ok(dt))?)?;
+
+    m.set(
+        "now",
+        lua.create_function({
+            let start_time = state.start_time.clone();
+            move |_lua, (): ()| {
+                Ok(LuaDt {
+                    duration: Instant::now() - start_time.get(),
+                })
+            }
+        })?,
+    )?;
+
+    create_runtime_fns(lua, &m, state.runtime_state)?;
 
     m.into_lua(lua)
 }
@@ -379,6 +529,10 @@ fn trace_args(script: &str) -> mlua::Result<Vec<ExpectedArg>> {
         args_state: ArgsState::Trace {
             expected_args: expected_args.clone(),
         },
+        runtime_state: RuntimeState {
+            sender: mpsc::channel(1).0,
+        },
+        start_time: Rc::new(Cell::new(Instant::now())),
     };
 
     let lua = create_lua(module)?;
@@ -399,19 +553,23 @@ struct Stage {
     rate: f64,
 }
 
-impl_from_lua_table!(Config, stages);
-impl_from_lua_table!(Stage, duration, rate);
+impl_from_lua_table!(Config, stages,);
+impl_from_lua_table!(Stage, duration, rate,);
 
 fn load_config(args: ArgsMap, source: NamedSource) -> mlua::Result<Config> {
     let lua = create_lua(Wrk3State {
         args_state: ArgsState::Runtime { args },
+        runtime_state: RuntimeState {
+            sender: mpsc::channel(1).0,
+        },
+        start_time: Rc::new(Cell::new(Instant::now())),
     })?;
 
     struct ModuleResult {
         config: Config,
     }
 
-    impl_from_lua_table!(ModuleResult, config);
+    impl_from_lua_table!(ModuleResult, config,);
 
     let module: ModuleResult = lua.load(source).eval()?;
     Ok(module.config)
@@ -422,6 +580,31 @@ mod tests {
     use indoc::indoc;
 
     use super::*;
+
+    fn run_script(src: &str) {
+        let lua = create_lua(Wrk3State {
+            args_state: ArgsState::Runtime {
+                args: Default::default(),
+            },
+            runtime_state: RuntimeState {
+                sender: mpsc::channel(1).0,
+            },
+            start_time: Rc::new(Cell::new(Instant::now())),
+        })
+        .unwrap();
+        lua.load(src).exec().unwrap();
+    }
+
+    #[test]
+    fn dt_arithmetic() {
+        run_script(indoc!(
+            "
+            local w = require 'wrk3'
+            assert(w.dt'10s' - 2 == w.dt'8s')
+            assert(w.dt'2s':secs() == 2)
+            "
+        ));
+    }
 
     #[test]
     fn traces_args() {
