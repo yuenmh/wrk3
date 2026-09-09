@@ -9,7 +9,8 @@ use std::{
     time::Duration,
 };
 
-use mlua::FromLua;
+use hyper::client::conn::http1;
+use mlua::{FromLua, IntoLua};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, de};
 
@@ -237,18 +238,14 @@ enum ArgError {
     Missing(String),
 }
 
-struct Args {
-    state: ArgsState,
-}
-
-impl Args {
+impl ArgsState {
     fn get_arg(
         &self,
         name: &str,
         expected_type: ArgTy,
         default_value: Option<ArgValue>,
     ) -> Result<ArgValue, ArgError> {
-        match &self.state {
+        match &self {
             ArgsState::Runtime { args } => {
                 let Some(value_s) = args.get(name) else {
                     if let Some(default) = default_value {
@@ -290,53 +287,58 @@ impl Args {
     }
 }
 
-impl mlua::UserData for Args {
-    fn add_methods<M: mlua::prelude::LuaUserDataMethods<Self>>(methods: &mut M) {
-        macro_rules! arg_method {
-            ($methods:expr, $name:ident, $rust_ty:ty, $enum_ty:ident) => {{
-                struct Opts {
-                    default: Option<$rust_ty>,
-                }
-                impl_from_lua_table!(Opts, default);
-                $methods.add_method(
-                    stringify!($name),
-                    |_lua, this, (arg_name, opts): (String, Option<Opts>)| {
+fn create_args_mod(lua: &mlua::Lua, state: ArgsState) -> mlua::Result<mlua::Value> {
+    let m = lua.create_table()?;
+
+    macro_rules! arg_method {
+        ($lua:expr, $m:expr, $state:expr, $name:ident, $rust_ty:ty, $enum_ty:ident) => {{
+            struct Opts {
+                default: Option<$rust_ty>,
+            }
+            impl_from_lua_table!(Opts, default);
+            m.set(
+                stringify!($name),
+                lua.create_function({
+                    let state = $state.clone();
+                    move |_lua, (name, opts): (String, Option<Opts>)| {
                         if let Some(opts) = opts {
-                            this.get_arg(
-                                &arg_name,
-                                ArgTy::$enum_ty,
-                                opts.default.map(ArgValue::$enum_ty),
-                            )
-                            .map_err(mlua::Error::external)
+                            state
+                                .get_arg(
+                                    &name,
+                                    ArgTy::$enum_ty,
+                                    opts.default.map(ArgValue::$enum_ty),
+                                )
+                                .map_err(mlua::Error::external)
                         } else {
-                            this.get_arg(&arg_name, ArgTy::$enum_ty, None)
+                            state
+                                .get_arg(&name, ArgTy::$enum_ty, None)
                                 .map_err(mlua::Error::external)
                         }
-                    },
-                );
-            }};
-        }
-
-        arg_method!(methods, int, i64, Int);
-        arg_method!(methods, float, f64, Float);
-        arg_method!(methods, bool, bool, Bool);
-        arg_method!(methods, string, RcStr, String);
-        arg_method!(methods, dt, LuaDt, Dt);
+                    }
+                })?,
+            )?;
+        }};
     }
+
+    arg_method!(lua, m, state, int, i64, Int);
+    arg_method!(lua, m, state, float, f64, Float);
+    arg_method!(lua, m, state, bool, bool, Bool);
+    arg_method!(lua, m, state, string, RcStr, String);
+    arg_method!(lua, m, state, dt, LuaDt, Dt);
+
+    m.into_lua(lua)
 }
 
-struct Wrk3Module {
+struct Wrk3State {
     args_state: ArgsState,
 }
 
-impl mlua::UserData for Wrk3Module {
-    fn add_fields<F: mlua::prelude::LuaUserDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("args", |_lua, module| {
-            Ok(Args {
-                state: module.args_state.clone(),
-            })
-        });
-    }
+fn create_wrk3_mod(lua: &mlua::Lua, state: Wrk3State) -> mlua::Result<mlua::Value> {
+    let m = lua.create_table()?;
+
+    m.set("args", create_args_mod(lua, state.args_state)?)?;
+
+    m.into_lua(lua)
 }
 
 #[derive(Copy, Clone)]
@@ -364,16 +366,16 @@ impl mlua::chunk::AsChunk for NamedSource<'_> {
     }
 }
 
-fn create_lua(module: Wrk3Module) -> mlua::Result<mlua::Lua> {
+fn create_lua(state: Wrk3State) -> mlua::Result<mlua::Lua> {
     let lua = mlua::Lua::new();
-    lua.register_module("wrk3", module)?;
+    lua.register_module("wrk3", create_wrk3_mod(&lua, state)?)?;
     Ok(lua)
 }
 
 fn trace_args(script: &str) -> mlua::Result<Vec<ExpectedArg>> {
     let expected_args = Rc::new(RefCell::new(Vec::new()));
 
-    let module = Wrk3Module {
+    let module = Wrk3State {
         args_state: ArgsState::Trace {
             expected_args: expected_args.clone(),
         },
@@ -401,7 +403,7 @@ impl_from_lua_table!(Config, stages);
 impl_from_lua_table!(Stage, duration, rate);
 
 fn load_config(args: ArgsMap, source: NamedSource) -> mlua::Result<Config> {
-    let lua = create_lua(Wrk3Module {
+    let lua = create_lua(Wrk3State {
         args_state: ArgsState::Runtime { args },
     })?;
 
@@ -427,9 +429,9 @@ mod tests {
             "
             local w = require 'wrk3'
 
-            w.args:int 'foo'
-            w.args:string('bar', { default = 'default value' })
-            w.args:dt('a', { default = '10s' })
+            w.args.int 'foo'
+            w.args.string('bar', { default = 'default value' })
+            w.args.dt('a', { default = '10s' })
             "
         ))
         .unwrap();
@@ -473,7 +475,7 @@ mod tests {
             M.config = {
                 stages = {
                     { duration = '10s', rate = 20.5 },
-                    { duration = w.args:dt 'duration', rate = 300 },
+                    { duration = w.args.dt 'duration', rate = 300 },
                 }
             }
             return M
