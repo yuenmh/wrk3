@@ -1,1 +1,3 @@
+mod script;
+
 fn main() {}
