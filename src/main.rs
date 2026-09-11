@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     net::{SocketAddr, ToSocketAddrs as _},
     ops::ControlFlow,
     path::{Path, PathBuf},
@@ -32,7 +33,7 @@ use tracing::{Instrument, level_filters::LevelFilter};
 
 use crate::script::{
     ArgTy, ArgsMap, DataPoint, LuaDt, MetricData, NamedSource, RuntimeMsg, RuntimeState, VuState,
-    load_config, trace_args,
+    data_point, load_config, trace_args,
 };
 
 mod script;
@@ -331,13 +332,34 @@ async fn vu_loop(
         NamedSource::new(&script.name, &script.source),
         RuntimeState {
             sender,
-            metrics,
-            start_time,
+            metrics: metrics.clone(),
+            start_time: start_time.clone(),
         },
     )?;
 
+    let mut last_active = Instant::now();
+
     while let Some(_info) = start_signal.next().await {
+        let before_run = Instant::now();
+        let inactive_time = before_run - last_active;
+
         state.run_main().await?;
+
+        let after_run = Instant::now();
+        last_active = after_run;
+        let active_time = after_run - before_run;
+
+        let ts = before_run - start_time.load();
+        metrics.send(data_point!(
+            ts,
+            "wrk3.vu_active",
+            duration = Dt(active_time.into())
+        ))?;
+        metrics.send(data_point!(
+            ts,
+            "wrk3.vu_inactive",
+            duration = Dt(inactive_time.into())
+        ))?;
     }
 
     Ok(())
@@ -545,6 +567,129 @@ async fn spawn_metrics_task(
 #[error("opening file {0}")]
 struct OpenFile(PathBuf);
 
+struct Stage {
+    start_time: Instant,
+    duration: Duration,
+    request_delay: Duration,
+}
+
+impl Stage {
+    fn end_time(&self) -> Instant {
+        self.start_time + self.duration
+    }
+
+    fn events_in_slice(&self, start: Instant, end: Instant) -> usize {
+        let start = std::cmp::max(self.start_time, start);
+        let end = std::cmp::min(self.end_time(), end);
+        if end <= start {
+            return 0;
+        }
+        // This is subtly wrong, but I am hoping it will come out in the wash.
+        // Consider (end - start) < request_delay. In some cases this interval may actually overlap
+        // an intended event time, but this always says it doesn't overlap.
+        ((end - start).as_secs_f64() / self.request_delay.as_secs_f64()) as usize
+    }
+}
+
+struct SteppedRateSchedule {
+    current_time: Instant,
+    stages: VecDeque<Stage>,
+    start_time: Instant,
+    total_duration: Duration,
+}
+
+trait Schedule {
+    /// Advance the current time and determine how many events were supposed to have taken place
+    fn advance(&mut self, now: Instant) -> usize;
+
+    fn next_event_time(&mut self) -> Option<Instant>;
+
+    fn progress(&self) -> f64;
+}
+
+impl Schedule for SteppedRateSchedule {
+    fn advance(&mut self, now: Instant) -> usize {
+        let mut events = 0;
+        while let Some(stage) = self.stages.front() {
+            events += stage.events_in_slice(self.current_time, now);
+            if now < stage.end_time() {
+                break;
+            }
+            self.stages.pop_front();
+        }
+        self.current_time = now;
+        events
+    }
+
+    fn next_event_time(&mut self) -> Option<Instant> {
+        Some(self.current_time + self.stages.front()?.request_delay)
+    }
+
+    fn progress(&self) -> f64 {
+        let since_start = self.current_time - self.start_time;
+        since_start.as_secs_f64() / self.total_duration.as_secs_f64()
+    }
+}
+
+impl SteppedRateSchedule {
+    fn new(start_time: Instant, script_stages: impl IntoIterator<Item = script::Stage>) -> Self {
+        let mut stages = Vec::new();
+        let mut stage_start = start_time;
+        for stage in script_stages {
+            let duration = stage.duration.into();
+            stages.push(Stage {
+                start_time,
+                duration,
+                request_delay: Duration::from_secs_f64(stage.rate.recip()),
+            });
+            stage_start += duration;
+        }
+        Self {
+            current_time: start_time,
+            stages: stages.into(),
+            start_time,
+            total_duration: stage_start - start_time,
+        }
+    }
+}
+
+async fn run_schedule(
+    start_time: Instant,
+    mut schedule: impl Schedule,
+    mut dispatcher: impl Dispatcher,
+    pool: &VuPool,
+    metrics: mpsc::UnboundedSender<DataPoint>,
+) -> anyhow::Result<()> {
+    let mut iteration_num = 0;
+
+    while let Some(next_time) = schedule.next_event_time() {
+        let num_events = schedule.advance(Instant::now());
+        tracing::trace!(num_events);
+
+        for _ in 0..num_events {
+            let ts = Instant::now() - start_time;
+
+            let res = dispatcher
+                .dispatch_iteration(pool, IterationInfo { num: iteration_num })
+                .map_err(|_| anyhow!("vu failed"))?;
+
+            metrics.send(data_point!(ts, "wrk3.iterations.d", value = Int(1)))?;
+
+            if matches!(res, DispatchOk::Skip) {
+                tracing::warn!(iteration_num, "iteration skipped");
+                metrics.send(data_point!(ts, "wrk3.skipped_iterations.d", value = Int(1)))?;
+            }
+
+            iteration_num += 1;
+        }
+
+        tracing::trace!(sleep_duration = ?(next_time - Instant::now()));
+        tokio::time::sleep_until(next_time.into()).await;
+    }
+
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -596,7 +741,7 @@ fn main() -> anyhow::Result<()> {
                 addr,
                 host: cli.host.into(),
             },
-            metrics_tx,
+            metrics_tx.clone(),
             Arc::new(args),
             Arc::new(Script {
                 name: script_name,
@@ -605,23 +750,26 @@ fn main() -> anyhow::Result<()> {
         )
         .await;
 
-        tokio::spawn(async move {
-            pool.set_start_time(Instant::now());
+        tokio::spawn(
+            async move {
+                let start_time = Instant::now();
+                pool.set_start_time(start_time);
 
-            let mut dispatcher = RoundRobinDispatcher::default();
-            for num in 0..1000 {
-                let res = dispatcher
-                    .dispatch_iteration(&pool, IterationInfo { num })
-                    .map_err(|_| anyhow!("vu failed"))?;
-                if matches!(res, DispatchOk::Skip) {
-                    tracing::warn!(num, "iteration skipped");
-                }
+                run_schedule(
+                    start_time,
+                    SteppedRateSchedule::new(start_time, config.stages),
+                    RoundRobinDispatcher::default(),
+                    &pool,
+                    metrics_tx,
+                )
+                .await?;
+
+                pool.join().await?;
+
+                Ok::<_, anyhow::Error>(())
             }
-
-            pool.join().await?;
-
-            Ok::<_, anyhow::Error>(())
-        })
+            .instrument(tracing::trace_span!("schedule")),
+        )
         .await
         .unwrap()?;
 

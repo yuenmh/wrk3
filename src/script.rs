@@ -425,6 +425,20 @@ pub struct DataPoint {
     pub values: FxHashMap<String, MetricData>,
 }
 
+macro_rules! data_point {
+    ($ts:expr, $name:expr, $($key:ident = $variant:ident ( $value:expr )),* $(,)?) => {
+        crate::script::DataPoint {
+            metric: $name.into(),
+            timestamp: $ts.into(),
+            values: rustc_hash::FxHashMap::from_iter([
+                $((stringify!($key).into(), crate::script::MetricData::$variant($value)),)*
+            ]),
+        }
+    };
+}
+
+pub(crate) use data_point;
+
 #[derive(Clone)]
 pub struct RuntimeState {
     pub sender: mpsc::Sender<RuntimeMsg>,
