@@ -1,10 +1,7 @@
 use std::{
-    cell::Cell,
     net::{SocketAddr, ToSocketAddrs as _},
     ops::ControlFlow,
-    path::PathBuf,
-    pin::pin,
-    rc::Rc,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -16,13 +13,16 @@ use anyhow::{Context as _, anyhow};
 use clap::{ArgAction, Parser};
 use crossbeam::atomic::AtomicCell;
 use futures::FutureExt as _;
-use hyper::{Request, body::Incoming, client::conn::http1::SendRequest};
+use hyper::{Request, client::conn::http1::SendRequest};
 use hyper_util::rt::TokioIo;
 use rustc_hash::FxHashMap;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpStream,
-    sync::{mpsc, oneshot},
+    sync::{
+        mpsc::{self, error::TrySendError},
+        oneshot,
+    },
 };
 use tokio_stream::{
     Stream, StreamExt,
@@ -31,8 +31,8 @@ use tokio_stream::{
 use tracing::{Instrument, level_filters::LevelFilter};
 
 use crate::script::{
-    ArgTy, ArgsMap, DataPoint, LuaDt, MetricData, NamedSource, Response, RuntimeMsg, RuntimeState,
-    VuState, load_config, trace_args,
+    ArgTy, ArgsMap, DataPoint, LuaDt, MetricData, NamedSource, RuntimeMsg, RuntimeState, VuState,
+    load_config, trace_args,
 };
 
 mod script;
@@ -140,28 +140,28 @@ fn resolve_connectable_address(addr: &str) -> Option<SocketAddr> {
         .find(|&addr| std::net::TcpStream::connect(addr).is_ok())
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum FatalError {
+    #[error("vu worker stopped")]
     VuDisconnected,
+    #[error("connection to server: {0}")]
     Connect(std::io::ErrorKind),
-    Handshake(hyper::Error),
-    RequestFormat(http::Error),
-}
-
-enum SendError {
-    Disconnected,
-    Timeout,
+    #[error("http handshake")]
+    Handshake(#[source] hyper::Error),
+    #[error("request formatting")]
+    RequestFormat(#[source] http::Error),
 }
 
 type HttpRequest = http::Request<String>;
 
 type HttpSender = SendRequest<String>;
 
-fn script_request_to_http(request: script::Request) -> Result<HttpRequest, FatalError> {
-    Ok(Request::builder()
+fn script_request_to_http(host: &str, request: script::Request) -> Result<HttpRequest, FatalError> {
+    Request::builder()
         .uri(request.path)
+        .header("host", host)
         .body(request.body.unwrap_or_default())
-        .map_err(|e| FatalError::RequestFormat(e))?)
+        .map_err(FatalError::RequestFormat)
 }
 
 struct ResponseInfo {
@@ -203,6 +203,7 @@ async fn handle_request_message(
 async fn handle_runtime_messages(
     addr: SocketAddr,
     messages: &mut (impl Stream<Item = RuntimeMsg> + Unpin),
+    host: &str,
 ) -> Result<ControlFlow<()>, FatalError> {
     let stream = TcpStream::connect(addr)
         .await
@@ -224,7 +225,7 @@ async fn handle_runtime_messages(
         match message {
             script::RuntimeMsg::Request { request, response } => {
                 let timeout = request.timeout.map(Into::into);
-                let request = script_request_to_http(request)?;
+                let request = script_request_to_http(host, request)?;
                 match handle_request_message(request, timeout, &mut sender).await {
                     Ok(resp) => {
                         response
@@ -260,13 +261,13 @@ async fn handle_runtime_messages(
     Ok(ControlFlow::Break(()))
 }
 
-#[tracing::instrument(level = "trace", skip_all, fields(%addr), ret)]
 async fn reactor_loop(
     addr: SocketAddr,
     messages: &mut (impl Stream<Item = RuntimeMsg> + Unpin),
+    host: &str,
 ) -> Result<(), FatalError> {
     loop {
-        match handle_runtime_messages(addr, messages).await? {
+        match handle_runtime_messages(addr, messages, host).await? {
             ControlFlow::Continue(_) => {}
             ControlFlow::Break(_) => break Ok(()),
         }
@@ -306,6 +307,238 @@ async fn collect_data_points_json_file(
     writer.flush().await?;
 
     Ok(())
+}
+
+struct Script {
+    name: String,
+    source: String,
+}
+
+struct IterationInfo {
+    num: usize,
+}
+
+async fn vu_loop(
+    args: Arc<FxHashMap<String, String>>,
+    script: Arc<Script>,
+    sender: mpsc::Sender<RuntimeMsg>,
+    metrics: mpsc::UnboundedSender<DataPoint>,
+    start_time: Arc<AtomicCell<Instant>>,
+    mut start_signal: impl Stream<Item = IterationInfo> + Unpin,
+) -> anyhow::Result<()> {
+    let state = VuState::new(
+        args,
+        NamedSource::new(&script.name, &script.source),
+        RuntimeState {
+            sender,
+            metrics,
+            start_time,
+        },
+    )?;
+
+    while let Some(_info) = start_signal.next().await {
+        state.run_main().await?;
+    }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+struct HostInfo {
+    addr: SocketAddr,
+    host: Arc<str>,
+}
+
+struct VuPool {
+    start_time: Arc<AtomicCell<Instant>>,
+    input_channels: Vec<mpsc::Sender<IterationInfo>>,
+    vu_handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+}
+
+impl VuPool {
+    async fn spawn(
+        num: usize,
+        host: HostInfo,
+        metrics: mpsc::UnboundedSender<DataPoint>,
+        args: ArgsMap,
+        script: Arc<Script>,
+    ) -> Self {
+        let start_time = Arc::new(AtomicCell::new(Instant::now()));
+        let mut input_channels = Vec::new();
+        let mut vu_handles = Vec::new();
+
+        let mut started_signals = Vec::new();
+
+        for vu_idx in 0..num {
+            let (input_tx, input_rx) = mpsc::channel(1);
+            let (runtime_tx, runtime_rx) = mpsc::channel(1);
+
+            let args = args.clone();
+            let script = script.clone();
+            let metrics = metrics.clone();
+            let start_time = start_time.clone();
+
+            let (vu_signal_tx, vu_signal_rx) = oneshot::channel();
+            let (reactor_signal_tx, reactor_signal_rx) = oneshot::channel();
+
+            started_signals.push(vu_signal_rx);
+            started_signals.push(reactor_signal_rx);
+
+            let host = host.clone();
+
+            let vu_jh = tokio::spawn(
+                async move {
+                    let vu_jh = tokio::spawn(
+                        async move {
+                            vu_signal_tx.send(()).unwrap();
+                            vu_loop(
+                                args,
+                                script,
+                                runtime_tx,
+                                metrics,
+                                start_time,
+                                ReceiverStream::new(input_rx),
+                            )
+                            .await
+                        }
+                        .instrument(tracing::trace_span!("script")),
+                    );
+                    let reactor_jh = tokio::spawn(
+                        async move {
+                            reactor_signal_tx.send(()).unwrap();
+                            reactor_loop(
+                                host.addr,
+                                &mut ReceiverStream::new(runtime_rx),
+                                &host.host,
+                            )
+                            .await
+                        }
+                        .instrument(tracing::trace_span!("reactor", addr = %host.addr)),
+                    );
+
+                    vu_jh.await.unwrap()?;
+                    reactor_jh.await.unwrap()?;
+
+                    Ok::<_, anyhow::Error>(())
+                }
+                .instrument(tracing::trace_span!("vu", idx = vu_idx)),
+            );
+
+            input_channels.push(input_tx);
+            vu_handles.push(vu_jh);
+        }
+
+        for signal in started_signals.drain(..) {
+            signal.await.unwrap();
+        }
+        tracing::trace!("all vus spawned");
+
+        VuPool {
+            start_time,
+            input_channels,
+            vu_handles,
+        }
+    }
+
+    fn set_start_time(&self, instant: Instant) {
+        self.start_time.store(instant);
+    }
+
+    async fn join(mut self) -> anyhow::Result<()> {
+        self.input_channels.clear();
+        for jh in self.vu_handles.drain(..) {
+            jh.await.unwrap()?;
+        }
+        Ok(())
+    }
+
+    fn count(&self) -> usize {
+        self.input_channels.len()
+    }
+
+    fn start_iteration(&self, vu_idx: usize, info: IterationInfo) -> Result<(), StartError> {
+        let tx = self
+            .input_channels
+            .get(vu_idx)
+            .expect("vu idx should be in range");
+
+        match tx.try_send(info) {
+            Ok(_) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(StartError::Occupied),
+            Err(TrySendError::Closed(_)) => Err(StartError::Failed),
+        }
+    }
+}
+
+enum DispatchOk {
+    Started,
+    Skip,
+}
+
+trait Dispatcher {
+    fn dispatch_iteration(&mut self, pool: &VuPool, info: IterationInfo) -> Result<DispatchOk, ()>;
+}
+
+#[derive(Default)]
+struct RoundRobinDispatcher {
+    next: usize,
+}
+
+impl Dispatcher for RoundRobinDispatcher {
+    fn dispatch_iteration(&mut self, pool: &VuPool, info: IterationInfo) -> Result<DispatchOk, ()> {
+        let res = match pool.start_iteration(self.next, info) {
+            Ok(_) => Ok(DispatchOk::Started),
+            Err(StartError::Occupied) => Ok(DispatchOk::Skip),
+            Err(StartError::Failed) => Err(()),
+        };
+        self.next = (self.next + 1).rem_euclid(pool.count());
+        res
+    }
+}
+
+enum StartError {
+    Occupied,
+    Failed,
+}
+
+async fn spawn_metrics_task(
+    output_file: Option<&Path>,
+) -> anyhow::Result<(
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    mpsc::UnboundedSender<DataPoint>,
+)> {
+    let (metrics_tx, metrics_rx) = mpsc::unbounded_channel::<DataPoint>();
+
+    let metrics_jh = if let Some(output_path) = &output_file {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output_path)
+            .await
+            .with_context(|| OpenFile(output_path.into()))?;
+        tokio::spawn(async move {
+            collect_data_points_json_file(&mut UnboundedReceiverStream::new(metrics_rx), &mut file)
+                .await
+        })
+    } else {
+        tokio::spawn(
+            async move {
+                let mut stream = UnboundedReceiverStream::new(metrics_rx);
+                while let Some(point) = stream.next().await {
+                    tracing::trace!(
+                        target: "wrk3::metrics",
+                        time = %point.timestamp,
+                        metric = point.metric,
+                        data = ?point.values,
+                    );
+                }
+                Ok(())
+            }
+            .instrument(tracing::trace_span!(target: "wrk3::metrics", "metrics")),
+        )
+    };
+
+    Ok((metrics_jh, metrics_tx))
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -355,69 +588,42 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     runtime.block_on(async {
-        let (runtime_tx, runtime_rx) = mpsc::channel(1);
-        let (metrics_tx, metrics_rx) = mpsc::unbounded_channel::<DataPoint>();
+        let (metrics_jh, metrics_tx) = spawn_metrics_task(cli.output.as_deref()).await?;
 
-        let metrics_jh = if let Some(output_path) = &cli.output {
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(output_path)
-                .await
-                .with_context(|| OpenFile(output_path.clone()))?;
-            tokio::spawn(async move {
-                collect_data_points_json_file(
-                    &mut UnboundedReceiverStream::new(metrics_rx),
-                    &mut file,
-                )
-                .await
-            })
-        } else {
-            tokio::spawn(
-                async move {
-                    let mut stream = UnboundedReceiverStream::new(metrics_rx);
-                    while let Some(point) = stream.next().await {
-                        tracing::trace!(
-                            time = %point.timestamp,
-                            metric = point.metric,
-                            data = ?point.values,
-                        );
-                    }
-                    Ok(())
-                }
-                .instrument(tracing::trace_span!("metrics")),
-            )
-        };
-
-        tokio::spawn({
-            let args = FxHashMap::clone(&args);
-            let script = script.clone();
-            let script_name = script_name.clone();
-            async move {
-                let start_time = Arc::new(AtomicCell::new(Instant::now()));
-                let state = VuState::new(
-                    Arc::new(args),
-                    NamedSource::new(&script_name, &script),
-                    RuntimeState {
-                        sender: runtime_tx,
-                        metrics: metrics_tx,
-                        start_time,
-                    },
-                )
-                .unwrap();
-                state.run_main().await.unwrap();
-                state.run_main().await.unwrap();
-                state.run_main().await.unwrap();
-            }
-        });
+        let pool = VuPool::spawn(
+            cli.vus,
+            HostInfo {
+                addr,
+                host: cli.host.into(),
+            },
+            metrics_tx,
+            Arc::new(args),
+            Arc::new(Script {
+                name: script_name,
+                source: script,
+            }),
+        )
+        .await;
 
         tokio::spawn(async move {
-            reactor_loop(addr, &mut ReceiverStream::new(runtime_rx))
-                .await
-                .unwrap();
+            pool.set_start_time(Instant::now());
+
+            let mut dispatcher = RoundRobinDispatcher::default();
+            for num in 0..1000 {
+                let res = dispatcher
+                    .dispatch_iteration(&pool, IterationInfo { num })
+                    .map_err(|_| anyhow!("vu failed"))?;
+                if matches!(res, DispatchOk::Skip) {
+                    tracing::warn!(num, "iteration skipped");
+                }
+            }
+
+            pool.join().await?;
+
+            Ok::<_, anyhow::Error>(())
         })
         .await
-        .unwrap();
+        .unwrap()?;
 
         metrics_jh.await.unwrap()?;
 
