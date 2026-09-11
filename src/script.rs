@@ -1,22 +1,20 @@
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    fmt::Debug,
+    fmt::{Debug, Display},
     num::{ParseFloatError, ParseIntError},
     ops::Deref,
     rc::Rc,
     str::FromStr,
-    time::{Duration, Instant, SystemTime},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
-use bytes::Bytes;
-use hyper::client::conn::http1;
+use crossbeam::atomic::AtomicCell;
 use mlua::{FromLua, IntoLua};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, de};
 use tokio::sync::{mpsc, oneshot};
-
-use crate::script::Method::Get;
 
 macro_rules! impl_from_lua_table {
     ($ty:ty, $($field:ident,)* $([$default_field:ident = $f:expr],)*) => {
@@ -32,8 +30,25 @@ macro_rules! impl_from_lua_table {
     };
 }
 
+macro_rules! impl_lua_enum {
+    ($ty:ty, $($str:literal => $variant:ident,)* _ => $err:expr $(,)?) => {
+        impl mlua::FromLua for $ty {
+            fn from_lua(
+                value: mlua::prelude::LuaValue,
+                lua: &mlua::prelude::Lua,
+            ) -> mlua::prelude::LuaResult<Self> {
+                let value_s = String::from_lua(value, lua)?;
+                match value_s.to_lowercase().as_str() {
+                    $($str => Ok(<$ty>::$variant),)*
+                    _ => Err($err),
+                }
+            }
+        }
+    };
+}
+
 #[derive(Clone, Copy)]
-struct LuaDt {
+pub struct LuaDt {
     duration: Duration,
 }
 
@@ -74,11 +89,38 @@ impl<'de> serde::Deserialize<'de> for LuaDt {
     }
 }
 
+impl serde::Serialize for LuaDt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        format!("{}", self.duration.as_nanos()).serialize(serializer)
+    }
+}
+
 impl Debug for LuaDt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("LuaDt")
             .field(&format!("{}", humantime::format_duration(self.duration)))
             .finish()
+    }
+}
+
+impl Display for LuaDt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", humantime::format_duration(self.duration))
+    }
+}
+
+impl From<LuaDt> for Duration {
+    fn from(value: LuaDt) -> Self {
+        value.duration
+    }
+}
+
+impl From<Duration> for LuaDt {
+    fn from(value: Duration) -> Self {
+        Self { duration: value }
     }
 }
 
@@ -92,7 +134,7 @@ enum RawDtValue {
 }
 
 #[derive(thiserror::Error, Debug)]
-enum ParseDtError {
+pub enum ParseDtError {
     #[error("value must be positive")]
     MustBePositive,
     #[error("invalid dt format: {0}")]
@@ -150,51 +192,12 @@ impl FromLua for LuaDt {
     }
 }
 
-#[derive(Clone)]
-struct RcStr(Rc<str>);
-
-impl<S> From<S> for RcStr
-where
-    S: Into<Rc<str>>,
-{
-    fn from(value: S) -> Self {
-        Self(value.into())
-    }
-}
-
-impl Debug for RcStr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.0)
-    }
-}
-
-impl std::fmt::Display for RcStr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl FromLua for RcStr {
-    fn from_lua(value: mlua::Value, lua: &mlua::Lua) -> mlua::Result<Self> {
-        let s = String::from_lua(value, lua)?;
-        Ok(Self(s.into()))
-    }
-}
-
-impl Deref for RcStr {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.deref()
-    }
-}
-
 #[derive(Clone, Debug)]
-enum ArgValue {
+pub enum ArgValue {
     Int(i64),
     Float(f64),
     Bool(bool),
-    String(RcStr),
+    String(String),
     Dt(LuaDt),
 }
 
@@ -211,7 +214,7 @@ impl mlua::IntoLua for ArgValue {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ArgTy {
+pub enum ArgTy {
     Int,
     Float,
     Bool,
@@ -220,21 +223,21 @@ enum ArgTy {
 }
 
 #[derive(Debug)]
-struct ExpectedArg {
-    name: String,
-    ty: ArgTy,
-    default_value: Option<ArgValue>,
+pub struct ExpectedArg {
+    pub name: String,
+    pub ty: ArgTy,
+    pub default_value: Option<ArgValue>,
 }
 
-type ArgsMap = Rc<FxHashMap<String, String>>;
+pub type ArgsMap = Arc<FxHashMap<String, String>>;
 
 #[derive(Clone)]
-enum ArgsState {
+pub enum ArgsState {
     Runtime {
         args: ArgsMap,
     },
     Trace {
-        expected_args: Rc<RefCell<Vec<ExpectedArg>>>,
+        expected_args: Arc<Mutex<Vec<ExpectedArg>>>,
     },
 }
 
@@ -282,7 +285,7 @@ impl ArgsState {
                 })
             }
             ArgsState::Trace { expected_args } => {
-                expected_args.borrow_mut().push(ExpectedArg {
+                expected_args.lock().unwrap().push(ExpectedArg {
                     name: name.into(),
                     ty: expected_type,
                     default_value,
@@ -337,7 +340,7 @@ fn create_args_mod(lua: &mlua::Lua, state: ArgsState) -> mlua::Result<mlua::Valu
     arg_method!(lua, m, state, int, i64, Int);
     arg_method!(lua, m, state, float, f64, Float);
     arg_method!(lua, m, state, bool, bool, Bool);
-    arg_method!(lua, m, state, string, RcStr, String);
+    arg_method!(lua, m, state, string, String, String);
     arg_method!(lua, m, state, dt, LuaDt, Dt);
 
     m.into_lua(lua)
@@ -351,29 +354,21 @@ enum Method {
     Patch,
 }
 
-impl FromLua for Method {
-    fn from_lua(
-        value: mlua::prelude::LuaValue,
-        lua: &mlua::prelude::Lua,
-    ) -> mlua::prelude::LuaResult<Self> {
-        let value_s = String::from_lua(value, lua)?;
-        match value_s.to_lowercase().as_str() {
-            "get" => Ok(Method::Get),
-            "post" => Ok(Method::Post),
-            "put" => Ok(Method::Put),
-            "delete" => Ok(Method::Delete),
-            "patch" => Ok(Method::Patch),
-            _ => Err(mlua::Error::external("expected a valid HTTP method")),
-        }
-    }
-}
+impl_lua_enum!(Method,
+    "get" => Get,
+    "post" => Post,
+    "put" => Put,
+    "delete" => Delete,
+    "patch" => Patch,
+    _ => mlua::Error::external("expected a valid HTTP method"),
+);
 
-struct Request {
-    path: String,
-    method: Method,
-    headers: Option<FxHashMap<String, String>>,
-    body: Option<String>,
-    timeout: Option<LuaDt>,
+pub struct Request {
+    pub path: String,
+    pub method: Method,
+    pub headers: Option<FxHashMap<String, String>>,
+    pub body: Option<String>,
+    pub timeout: Option<LuaDt>,
 }
 
 impl_from_lua_table!(
@@ -385,19 +380,29 @@ impl_from_lua_table!(
     [timeout = |_| None],
 );
 
-enum ResponseError {
+pub enum ResponseError {
     TimedOut,
     Disconnected,
 }
 
-struct Response {
-    status: u16,
-    error: Option<ResponseError>,
+pub struct Response {
+    pub status: u16,
+    pub error: Option<ResponseError>,
 }
 
-impl mlua::UserData for Response {}
+impl mlua::UserData for Response {
+    fn add_fields<F: mlua::prelude::LuaUserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("status", |_, this| Ok(this.status));
+        fields.add_field_method_get("is_timeout", |_, this| {
+            Ok(matches!(this.error, Some(ResponseError::TimedOut)))
+        });
+        fields.add_field_method_get("is_disconnect", |_, this| {
+            Ok(matches!(this.error, Some(ResponseError::Disconnected)))
+        });
+    }
+}
 
-enum RuntimeMsg {
+pub enum RuntimeMsg {
     Request {
         request: Request,
         response: oneshot::Sender<Response>,
@@ -408,9 +413,94 @@ enum RuntimeMsg {
     },
 }
 
+#[derive(Debug)]
+pub enum MetricData {
+    Int(i64),
+    Float(f64),
+    Dt(LuaDt),
+    Bool(bool),
+}
+
+#[derive(Debug)]
+pub struct DataPoint {
+    pub metric: String,
+    pub timestamp: LuaDt,
+    pub values: FxHashMap<String, MetricData>,
+}
+
 #[derive(Clone)]
-struct RuntimeState {
-    sender: mpsc::Sender<RuntimeMsg>,
+pub struct RuntimeState {
+    pub sender: mpsc::Sender<RuntimeMsg>,
+    pub metrics: mpsc::UnboundedSender<DataPoint>,
+    pub start_time: Arc<AtomicCell<Instant>>,
+}
+
+struct LuaMetric {
+    metrics: mpsc::UnboundedSender<DataPoint>,
+    start_time: Arc<AtomicCell<Instant>>,
+    schema: MetricSchema,
+}
+
+impl mlua::UserData for LuaMetric {
+    fn add_methods<M: mlua::prelude::LuaUserDataMethods<Self>>(methods: &mut M) {
+        struct AddExtraArgs {
+            at: Option<LuaDt>,
+        }
+        impl_from_lua_table!(AddExtraArgs, at,);
+
+        methods.add_method(
+            "add",
+            |lua, this, (table, extra): (mlua::Table, Option<AddExtraArgs>)| {
+                let mut datapoint = DataPoint {
+                    metric: this.schema.name.clone(),
+                    timestamp: extra.and_then(|e| e.at).unwrap_or_else(|| LuaDt {
+                        duration: Instant::now() - this.start_time.load(),
+                    }),
+                    values: FxHashMap::default(),
+                };
+                for pair in table.pairs() {
+                    let (key, value): (String, mlua::Value) = pair?;
+                    let value = if let Some(schema_ty) = this.schema.cols.get(&key) {
+                        match schema_ty {
+                            ColType::Dt => MetricData::Dt(LuaDt::from_lua(value, lua)?),
+                            ColType::Int => MetricData::Int(i64::from_lua(value, lua)?),
+                            ColType::Float => MetricData::Float(f64::from_lua(value, lua)?),
+                            ColType::Bool => MetricData::Bool(bool::from_lua(value, lua)?),
+                        }
+                    } else {
+                        match value {
+                            mlua::Value::Boolean(b) => MetricData::Bool(b),
+                            mlua::Value::UserData(_) => {
+                                MetricData::Dt(LuaDt::from_lua(value, lua)?)
+                            }
+                            mlua::Value::Integer(i) => MetricData::Int(i),
+                            mlua::Value::Number(n) => MetricData::Float(n),
+                            _ => return Err(mlua::Error::external("unsupported value type")),
+                        }
+                    };
+                    datapoint.values.insert(key, value);
+                }
+                this.metrics
+                    .send(datapoint)
+                    .map_err(|_| mlua::Error::external("disconnected from runtime"))?;
+                Ok(())
+            },
+        );
+    }
+}
+
+impl serde::Serialize for MetricData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            MetricData::Int(i) => i.serialize(serializer),
+            MetricData::Float(f) => f.serialize(serializer),
+            MetricData::Dt(lua_dt) => lua_dt.serialize(serializer),
+            MetricData::Bool(b) => b.serialize(serializer),
+        }
+    }
 }
 
 fn create_runtime_fns(lua: &mlua::Lua, m: &mlua::Table, state: RuntimeState) -> mlua::Result<()> {
@@ -458,13 +548,26 @@ fn create_runtime_fns(lua: &mlua::Lua, m: &mlua::Table, state: RuntimeState) -> 
         })?,
     )?;
 
+    m.set(
+        "metric",
+        lua.create_function({
+            let state = state.clone();
+            move |_lua, schema: MetricSchema| {
+                Ok(LuaMetric {
+                    metrics: state.metrics.clone(),
+                    start_time: state.start_time.clone(),
+                    schema,
+                })
+            }
+        })?,
+    )?;
+
     Ok(())
 }
 
-struct Wrk3State {
-    args_state: ArgsState,
-    runtime_state: RuntimeState,
-    start_time: Rc<Cell<Instant>>,
+pub struct Wrk3State {
+    pub args_state: ArgsState,
+    pub runtime_state: RuntimeState,
 }
 
 fn create_wrk3_mod(lua: &mlua::Lua, state: Wrk3State) -> mlua::Result<mlua::Value> {
@@ -477,10 +580,10 @@ fn create_wrk3_mod(lua: &mlua::Lua, state: Wrk3State) -> mlua::Result<mlua::Valu
     m.set(
         "now",
         lua.create_function({
-            let start_time = state.start_time.clone();
+            let start_time = state.runtime_state.start_time.clone();
             move |_lua, (): ()| {
                 Ok(LuaDt {
-                    duration: Instant::now() - start_time.get(),
+                    duration: Instant::now() - start_time.load(),
                 })
             }
         })?,
@@ -492,13 +595,13 @@ fn create_wrk3_mod(lua: &mlua::Lua, state: Wrk3State) -> mlua::Result<mlua::Valu
 }
 
 #[derive(Copy, Clone)]
-struct NamedSource<'a> {
+pub struct NamedSource<'a> {
     name: &'a str,
     code: &'a str,
 }
 
 impl<'a> NamedSource<'a> {
-    fn new(name: &'a str, code: &'a str) -> Self {
+    pub fn new(name: &'a str, code: &'a str) -> Self {
         Self { name, code }
     }
 }
@@ -512,18 +615,19 @@ impl mlua::chunk::AsChunk for NamedSource<'_> {
     }
 
     fn name(&self) -> Option<String> {
-        Some(self.name.into())
+        // gets rid of `[string "<name>"]` formatting of filename
+        Some(format!("@{}", self.name))
     }
 }
 
-fn create_lua(state: Wrk3State) -> mlua::Result<mlua::Lua> {
+pub fn create_lua(state: Wrk3State) -> mlua::Result<mlua::Lua> {
     let lua = mlua::Lua::new();
     lua.register_module("wrk3", create_wrk3_mod(&lua, state)?)?;
     Ok(lua)
 }
 
-fn trace_args(script: &str) -> mlua::Result<Vec<ExpectedArg>> {
-    let expected_args = Rc::new(RefCell::new(Vec::new()));
+pub fn trace_args(script: &str) -> mlua::Result<Vec<ExpectedArg>> {
+    let expected_args = Arc::new(Mutex::new(Vec::new()));
 
     let module = Wrk3State {
         args_state: ArgsState::Trace {
@@ -531,48 +635,105 @@ fn trace_args(script: &str) -> mlua::Result<Vec<ExpectedArg>> {
         },
         runtime_state: RuntimeState {
             sender: mpsc::channel(1).0,
+            metrics: mpsc::unbounded_channel().0,
+            start_time: Arc::new(AtomicCell::new(Instant::now())),
         },
-        start_time: Rc::new(Cell::new(Instant::now())),
     };
 
     let lua = create_lua(module)?;
     // tracing the args involves supplying dummy values. therefore the script might fail, but we don't care
     let _ = lua.load(script).exec();
 
-    Ok(expected_args.take())
+    Ok(std::mem::take(&mut expected_args.lock().unwrap()))
 }
 
 #[derive(Deserialize, Debug)]
-struct Config {
-    stages: Vec<Stage>,
+pub struct WorkloadConfig {
+    pub stages: Vec<Stage>,
 }
 
 #[derive(Deserialize, Debug)]
-struct Stage {
-    duration: LuaDt,
-    rate: f64,
+pub struct Stage {
+    pub duration: LuaDt,
+    pub rate: f64,
 }
 
-impl_from_lua_table!(Config, stages,);
+impl_from_lua_table!(WorkloadConfig, stages,);
 impl_from_lua_table!(Stage, duration, rate,);
 
-fn load_config(args: ArgsMap, source: NamedSource) -> mlua::Result<Config> {
+enum ColType {
+    Dt,
+    Int,
+    Float,
+    Bool,
+}
+
+impl_lua_enum!(ColType,
+    "dt" => Dt,
+    "int" => Int,
+    "float" => Float,
+    "bool" => Bool,
+    _ => mlua::Error::external("expected a valid column type"),
+);
+
+struct MetricSchema {
+    name: String,
+    cols: FxHashMap<String, ColType>,
+}
+impl_from_lua_table!(MetricSchema, name, cols,);
+
+struct MetricsConfig {
+    metrics: Vec<MetricSchema>,
+}
+
+pub fn load_config(args: ArgsMap, source: NamedSource) -> mlua::Result<WorkloadConfig> {
     let lua = create_lua(Wrk3State {
         args_state: ArgsState::Runtime { args },
         runtime_state: RuntimeState {
             sender: mpsc::channel(1).0,
+            metrics: mpsc::unbounded_channel().0,
+            start_time: Arc::new(AtomicCell::new(Instant::now())),
         },
-        start_time: Rc::new(Cell::new(Instant::now())),
     })?;
 
     struct ModuleResult {
-        config: Config,
+        config: WorkloadConfig,
     }
 
     impl_from_lua_table!(ModuleResult, config,);
 
     let module: ModuleResult = lua.load(source).eval()?;
     Ok(module.config)
+}
+
+pub struct VuState {
+    lua: mlua::Lua,
+    main: mlua::Function,
+}
+
+impl VuState {
+    pub fn new(args: ArgsMap, source: NamedSource, state: RuntimeState) -> mlua::Result<Self> {
+        let lua = create_lua(Wrk3State {
+            args_state: ArgsState::Runtime { args },
+            runtime_state: state,
+        })?;
+
+        struct ModuleResult {
+            main: mlua::Function,
+        }
+        impl_from_lua_table!(ModuleResult, main,);
+
+        let module: ModuleResult = lua.load(source).eval()?;
+
+        Ok(Self {
+            lua,
+            main: module.main,
+        })
+    }
+
+    pub async fn run_main(&self) -> mlua::Result<()> {
+        self.main.call_async(()).await
+    }
 }
 
 #[cfg(test)]
@@ -588,8 +749,9 @@ mod tests {
             },
             runtime_state: RuntimeState {
                 sender: mpsc::channel(1).0,
+                metrics: mpsc::unbounded_channel().0,
+                start_time: Arc::new(AtomicCell::new(Instant::now())),
             },
-            start_time: Rc::new(Cell::new(Instant::now())),
         })
         .unwrap();
         lua.load(src).exec().unwrap();
