@@ -7,8 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context as _;
 use crossbeam::atomic::AtomicCell;
-use mlua::{FromLua, IntoLua};
+use mlua::{FromLua, IntoLua, LuaSerdeExt as _};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, de};
 use tokio::sync::{mpsc, oneshot};
@@ -612,6 +613,28 @@ fn create_wrk3_mod(lua: &mlua::Lua, state: Wrk3State) -> mlua::Result<mlua::Valu
         })?,
     )?;
 
+    m.set(
+        "formdata",
+        lua.create_function(|_, table: mlua::Table| {
+            let mut s = form_urlencoded::Serializer::new(String::new());
+            for pair in table.pairs::<String, String>() {
+                let (k, v) = pair?;
+                s.append_pair(&k, &v);
+            }
+            Ok(s.finish())
+        })?,
+    )?;
+
+    m.set(
+        "json",
+        lua.create_function(|lua, value: mlua::Value| {
+            let json_value: serde_json::Value = lua.from_value(value)?;
+            serde_json::to_string(&json_value)
+                .context("serializing value to JSON")
+                .map_err(mlua::Error::external)
+        })?,
+    )?;
+
     create_runtime_fns(lua, &m, state.runtime_state)?;
 
     m.into_lua(lua)
@@ -730,6 +753,17 @@ pub struct VuState {
     #[expect(unused)]
     lua: mlua::Lua,
     main: mlua::Function,
+    randomseed_fn: mlua::Function,
+}
+
+pub struct MainCtx {
+    pub iteration: usize,
+}
+
+impl mlua::UserData for MainCtx {
+    fn add_fields<F: mlua::prelude::LuaUserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("iteration", |_, this| Ok(this.iteration));
+    }
 }
 
 impl VuState {
@@ -746,14 +780,25 @@ impl VuState {
 
         let module: ModuleResult = lua.load(source).eval()?;
 
+        let randomseed_fn = lua
+            .globals()
+            .get::<mlua::Table>("math")?
+            .get("randomseed")?;
+
         Ok(Self {
             lua,
             main: module.main,
+            randomseed_fn,
         })
     }
 
-    pub async fn run_main(&self) -> mlua::Result<()> {
-        self.main.call_async(()).await
+    pub fn seed_random(&self, seed: u64) -> mlua::Result<()> {
+        self.randomseed_fn.call::<()>(seed)?;
+        Ok(())
+    }
+
+    pub async fn run_main(&self, ctx: MainCtx) -> mlua::Result<()> {
+        self.main.call_async(ctx).await
     }
 }
 

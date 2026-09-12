@@ -34,8 +34,8 @@ use tracing::{Instrument, Span, level_filters::LevelFilter};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::script::{
-    ArgTy, ArgsMap, DataPoint, LuaDt, MetricData, NamedSource, RuntimeMsg, RuntimeState, VuState,
-    data_point, load_config, trace_args,
+    ArgTy, ArgsMap, DataPoint, LuaDt, MainCtx, MetricData, NamedSource, RuntimeMsg, RuntimeState,
+    VuState, data_point, load_config, trace_args,
 };
 
 mod script;
@@ -382,7 +382,6 @@ struct Script {
 }
 
 struct IterationInfo {
-    #[expect(unused)]
     num: usize,
 }
 
@@ -406,11 +405,16 @@ async fn vu_loop(
 
     let mut last_active = Instant::now();
 
-    while let Some(_info) = start_signal.next().await {
+    while let Some(info) = start_signal.next().await {
         let before_run = Instant::now();
         let inactive_time = before_run - last_active;
 
-        state.run_main().await?;
+        state.seed_random(info.num as u64)?;
+        state
+            .run_main(MainCtx {
+                iteration: info.num,
+            })
+            .await?;
 
         let after_run = Instant::now();
         last_active = after_run;
@@ -799,7 +803,6 @@ fn main() -> anyhow::Result<()> {
         }
         println!();
     }
-    println!();
 
     let config = load_config(
         Arc::new(args.clone()),
@@ -857,16 +860,19 @@ fn main() -> anyhow::Result<()> {
                         .progress_chars("=> "),
                 );
 
-                run_schedule(
+                let schedule_res = run_schedule(
                     start_time,
                     SteppedRateSchedule::new(start_time, config.stages),
                     RoundRobinDispatcher::default(),
                     &pool,
                     metrics_tx,
                 )
-                .await?;
+                .await;
 
+                // the errors from the pool will be better since it will have the actual lua errors
                 pool.join().await?;
+
+                schedule_res?;
 
                 Ok::<_, anyhow::Error>(())
             }
