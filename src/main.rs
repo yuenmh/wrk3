@@ -200,6 +200,8 @@ fn resolve_connectable_address(addr: &str) -> Option<SocketAddr> {
 enum FatalError {
     #[error("vu worker stopped")]
     VuDisconnected,
+    #[error("metrics collector stopped")]
+    MetricsDisconnected,
     #[error("connection to server: {0}")]
     Connect(std::io::ErrorKind),
     #[error("http handshake")]
@@ -274,6 +276,8 @@ async fn handle_runtime_messages(
     addr: SocketAddr,
     messages: &mut (impl Stream<Item = RuntimeMsg> + Unpin),
     host: &str,
+    start_time: Arc<AtomicCell<Instant>>,
+    metrics: mpsc::UnboundedSender<DataPoint>,
 ) -> Result<ControlFlow<()>, FatalError> {
     let stream = TcpStream::connect(addr)
         .await
@@ -282,11 +286,24 @@ async fn handle_runtime_messages(
         .await
         .map_err(FatalError::Handshake)?;
 
+    metrics
+        .send(data_point!(
+            Instant::now() - start_time.load(),
+            "wrk3.tcp_connections.d",
+            value = Int(1)
+        ))
+        .map_err(|_| FatalError::MetricsDisconnected)?;
+
     tokio::spawn(
         async move {
             let _ = conn.await.inspect_err(|err| {
                 tracing::trace!(%err);
             });
+            let _ = metrics.send(data_point!(
+                Instant::now() - start_time.load(),
+                "wrk3.tcp_disconnections.d",
+                value = Int(1)
+            ));
         }
         .instrument(tracing::trace_span!("conn")),
     );
@@ -335,9 +352,13 @@ async fn reactor_loop(
     addr: SocketAddr,
     messages: &mut (impl Stream<Item = RuntimeMsg> + Unpin),
     host: &str,
+    start_time: Arc<AtomicCell<Instant>>,
+    metrics: mpsc::UnboundedSender<DataPoint>,
 ) -> Result<(), FatalError> {
     loop {
-        match handle_runtime_messages(addr, messages, host).await? {
+        match handle_runtime_messages(addr, messages, host, start_time.clone(), metrics.clone())
+            .await?
+        {
             ControlFlow::Continue(_) => {}
             ControlFlow::Break(_) => break Ok(()),
         }
@@ -486,7 +507,9 @@ impl VuPool {
 
             let vu_jh = tokio::spawn(
                 async move {
-                    let vu_jh = tokio::spawn(
+                    let vu_jh = tokio::spawn({
+                        let metrics = metrics.clone();
+                        let start_time = start_time.clone();
                         async move {
                             vu_signal_tx.send(()).unwrap();
                             vu_loop(
@@ -499,8 +522,8 @@ impl VuPool {
                             )
                             .await
                         }
-                        .instrument(tracing::trace_span!("script")),
-                    );
+                        .instrument(tracing::trace_span!("script"))
+                    });
                     let reactor_jh = tokio::spawn(
                         async move {
                             reactor_signal_tx.send(()).unwrap();
@@ -508,6 +531,8 @@ impl VuPool {
                                 host.addr,
                                 &mut ReceiverStream::new(runtime_rx),
                                 &host.host,
+                                start_time,
+                                metrics,
                             )
                             .await
                         }
