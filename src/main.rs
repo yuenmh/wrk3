@@ -656,6 +656,7 @@ struct Stage {
     start_time: Instant,
     duration: Duration,
     request_delay: Duration,
+    emitted: usize,
 }
 
 impl Stage {
@@ -663,16 +664,16 @@ impl Stage {
         self.start_time + self.duration
     }
 
-    fn events_in_slice(&self, start: Instant, end: Instant) -> usize {
-        let start = std::cmp::max(self.start_time, start);
-        let end = std::cmp::min(self.end_time(), end);
-        if end <= start {
+    fn nth_event_time(&self, n: usize) -> Instant {
+        self.start_time + (n as u32 * self.request_delay)
+    }
+
+    fn events_due(&self, now: Instant) -> usize {
+        let now = std::cmp::min(now, self.end_time());
+        if now <= self.start_time {
             return 0;
         }
-        // This is subtly wrong, but I am hoping it will come out in the wash.
-        // Consider (end - start) < request_delay. In some cases this interval may actually overlap
-        // an intended event time, but this always says it doesn't overlap.
-        ((end - start).as_secs_f64() / self.request_delay.as_secs_f64()) as usize
+        ((now - self.start_time).as_secs_f64() / self.request_delay.as_secs_f64()) as usize
     }
 }
 
@@ -695,8 +696,11 @@ trait Schedule {
 impl Schedule for SteppedRateSchedule {
     fn advance(&mut self, now: Instant) -> usize {
         let mut events = 0;
-        while let Some(stage) = self.stages.front() {
-            events += stage.events_in_slice(self.current_time, now);
+        while let Some(stage) = self.stages.front_mut() {
+            let due = stage.events_due(now);
+            events += due - stage.emitted;
+            stage.emitted = due;
+
             if now < stage.end_time() {
                 break;
             }
@@ -707,7 +711,8 @@ impl Schedule for SteppedRateSchedule {
     }
 
     fn next_event_time(&mut self) -> Option<Instant> {
-        Some(self.current_time + self.stages.front()?.request_delay)
+        let stage = self.stages.front()?;
+        Some(stage.nth_event_time(stage.emitted + 1))
     }
 
     fn progress(&self) -> f64 {
@@ -726,6 +731,7 @@ impl SteppedRateSchedule {
                 start_time: stage_start,
                 duration,
                 request_delay: Duration::from_secs_f64(stage.rate.recip()),
+                emitted: 0,
             });
             stage_start += duration;
         }
