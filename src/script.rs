@@ -60,6 +60,16 @@ impl mlua::UserData for LuaDt {
                 duration: this.duration - rhs.duration,
             })
         });
+        methods.add_meta_method(mlua::MetaMethod::Add, |_, this, rhs: LuaDt| {
+            Ok(LuaDt {
+                duration: this.duration + rhs.duration,
+            })
+        });
+        methods.add_meta_method(mlua::MetaMethod::Mul, |_, this, rhs: f64| {
+            Ok(LuaDt {
+                duration: Duration::from_secs_f64(this.duration.as_secs_f64() * rhs),
+            })
+        });
         methods.add_meta_method(mlua::MetaMethod::Eq, |_, this, rhs: LuaDt| {
             Ok(this.duration == rhs.duration)
         });
