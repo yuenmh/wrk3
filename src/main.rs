@@ -773,6 +773,12 @@ async fn run_schedule(
             if matches!(res, DispatchOk::Skip) {
                 tracing::warn!(iteration_num, "iteration skipped");
                 metrics.send(data_point!(ts, "wrk3.skipped_iterations.d", value = Int(1)))?;
+            } else {
+                metrics.send(data_point!(
+                    ts,
+                    "wrk3.completed_iterations.d",
+                    value = Int(1)
+                ))?;
             }
 
             iteration_num += 1;
