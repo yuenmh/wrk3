@@ -210,6 +210,18 @@ impl mlua::IntoLua for ArgValue {
     }
 }
 
+impl Display for ArgValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArgValue::Int(i) => write!(f, "{i}"),
+            ArgValue::Float(n) => write!(f, "{n}"),
+            ArgValue::Bool(b) => write!(f, "{b}"),
+            ArgValue::String(s) => write!(f, "{s}"),
+            ArgValue::Dt(dt) => write!(f, "{dt}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum ArgTy {
     Int,
@@ -277,7 +289,7 @@ impl ArgsState {
                         "false" => ArgValue::Bool(false),
                         _ => return Err(ArgError::ExpectedBool),
                     },
-                    ArgTy::String => ArgValue::String(value_s.clone().into()),
+                    ArgTy::String => ArgValue::String(value_s.clone()),
                     ArgTy::Dt => ArgValue::Dt(value_s.parse().map_err(ArgError::DtFormat)?),
                 })
             }
@@ -343,7 +355,7 @@ fn create_args_mod(lua: &mlua::Lua, state: ArgsState) -> mlua::Result<mlua::Valu
     m.into_lua(lua)
 }
 
-enum Method {
+pub enum Method {
     Get,
     Post,
     Put,
@@ -693,10 +705,6 @@ struct MetricSchema {
 }
 impl_from_lua_table!(MetricSchema, name, cols,);
 
-struct MetricsConfig {
-    metrics: Vec<MetricSchema>,
-}
-
 pub fn load_config(args: ArgsMap, source: NamedSource) -> mlua::Result<WorkloadConfig> {
     let lua = create_lua(Wrk3State {
         args_state: ArgsState::Runtime { args },
@@ -718,6 +726,8 @@ pub fn load_config(args: ArgsMap, source: NamedSource) -> mlua::Result<WorkloadC
 }
 
 pub struct VuState {
+    // must be kept alive
+    #[expect(unused)]
     lua: mlua::Lua,
     main: mlua::Function,
 }

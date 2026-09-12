@@ -16,6 +16,7 @@ use crossbeam::atomic::AtomicCell;
 use futures::FutureExt as _;
 use hyper::{Request, client::conn::http1::SendRequest};
 use hyper_util::rt::TokioIo;
+use indicatif::ProgressStyle;
 use rustc_hash::FxHashMap;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt, BufWriter},
@@ -29,7 +30,8 @@ use tokio_stream::{
     Stream, StreamExt,
     wrappers::{ReceiverStream, UnboundedReceiverStream},
 };
-use tracing::{Instrument, level_filters::LevelFilter};
+use tracing::{Instrument, Span, level_filters::LevelFilter};
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::script::{
     ArgTy, ArgsMap, DataPoint, LuaDt, MetricData, NamedSource, RuntimeMsg, RuntimeState, VuState,
@@ -38,7 +40,10 @@ use crate::script::{
 
 mod script;
 
+shadow_rs::shadow!(build);
+
 #[derive(clap::Parser)]
+#[command(version = version_string_static())]
 struct Cli {
     /// Lua script that defines workload schedule and behavior
     script: PathBuf,
@@ -60,8 +65,45 @@ struct Cli {
     trailing: Vec<String>,
 }
 
+fn banner() -> &'static str {
+    concat!(
+        r"   _     _     __ ____   __ __ _____ ",
+        "\n",
+        r"  | |   / |   / // __ \ / // //____ |",
+        "\n",
+        r"  | |  /  |  / // /_/ // //_/    _/_/",
+        "\n",
+        r"  | | / / | / // __ _// /\ \     \ \ ",
+        "\n",
+        r"  | |/ /| |/ // / \ \/ /  \ \____/ / ",
+        "\n",
+        r"  |___/ |___//_/   \_\/    \_\____/  ",
+        "\n",
+    )
+}
+
+fn version_string() -> String {
+    if build::GIT_CLEAN {
+        format!("{} ({})", build::PKG_VERSION, build::SHORT_COMMIT)
+    } else {
+        format!("{} ({}*)", build::PKG_VERSION, build::SHORT_COMMIT)
+    }
+}
+
+fn version_string_static() -> &'static str {
+    Box::leak(version_string().into_boxed_str())
+}
+
 fn setup_tracing() -> anyhow::Result<()> {
-    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt};
+    use tracing_indicatif::{
+        IndicatifLayer,
+        filter::{IndicatifFilter, hide_indicatif_span_fields},
+    };
+    use tracing_subscriber::{
+        Layer as _, fmt::format::DefaultFields, layer::SubscriberExt as _, util::SubscriberInitExt,
+    };
+
+    let indicatif_layer = IndicatifLayer::new();
 
     tracing_subscriber::registry()
         .with(
@@ -71,12 +113,17 @@ fn setup_tracing() -> anyhow::Result<()> {
                         | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
                 )
                 .with_thread_names(false)
-                .with_writer(std::io::stderr)
+                .with_writer(indicatif_layer.get_stderr_writer())
                 .with_filter(
                     tracing_subscriber::EnvFilter::builder()
                         .with_default_directive(LevelFilter::INFO.into())
                         .from_env()?,
                 ),
+        )
+        .with(
+            indicatif_layer
+                .with_span_field_formatter(hide_indicatif_span_fields(DefaultFields::new()))
+                .with_filter(IndicatifFilter::new(false)),
         )
         .init();
     Ok(())
@@ -111,7 +158,11 @@ fn parse_script_args(
                     .action(ArgAction::SetFalse),
             );
         } else {
-            cmd = cmd.arg(clap::Arg::new(&param.name).long(&param.name));
+            let mut arg = clap::Arg::new(&param.name).long(&param.name);
+            if let Some(default) = &param.default_value {
+                arg = arg.default_value(default.to_string());
+            }
+            cmd = cmd.arg(arg);
         }
     }
 
@@ -158,10 +209,24 @@ type HttpRequest = http::Request<String>;
 type HttpSender = SendRequest<String>;
 
 fn script_request_to_http(host: &str, request: script::Request) -> Result<HttpRequest, FatalError> {
-    Request::builder()
+    let mut b = Request::builder()
         .uri(request.path)
-        .header("host", host)
-        .body(request.body.unwrap_or_default())
+        .method(match request.method {
+            script::Method::Get => "GET",
+            script::Method::Post => "POST",
+            script::Method::Put => "PUT",
+            script::Method::Delete => "DELETE",
+            script::Method::Patch => "PATCH",
+        })
+        .header("host", host);
+
+    if let Some(headers) = request.headers {
+        for (key, value) in headers {
+            b = b.header(key, value);
+        }
+    }
+
+    b.body(request.body.unwrap_or_default())
         .map_err(FatalError::RequestFormat)
 }
 
@@ -290,13 +355,14 @@ async fn collect_data_points_json_file(
 
     let mut buf = Vec::new();
 
-    while let Some(item) = stream.next().await {
+    while let Some(point) = stream.next().await {
+        trace_data_point(&point);
         serde_json::to_writer(
             &mut buf,
             &DataPointSer {
-                metric: item.metric,
-                time: item.timestamp,
-                data: item.values,
+                metric: point.metric,
+                time: point.timestamp,
+                data: point.values,
             },
         )
         .expect("serialization should succeed");
@@ -316,6 +382,7 @@ struct Script {
 }
 
 struct IterationInfo {
+    #[expect(unused)]
     num: usize,
 }
 
@@ -523,6 +590,19 @@ enum StartError {
     Failed,
 }
 
+fn trace_data_point(point: &DataPoint) {
+    tracing::trace!(
+        target: "wrk3::metrics",
+        time = %point.timestamp,
+        metric = point.metric,
+        data = ?point.values,
+    );
+}
+
+fn metrics_span() -> Span {
+    tracing::trace_span!(target: "wrk3::metrics", "metrics")
+}
+
 async fn spawn_metrics_task(
     output_file: Option<&Path>,
 ) -> anyhow::Result<(
@@ -538,25 +618,26 @@ async fn spawn_metrics_task(
             .open(output_path)
             .await
             .with_context(|| OpenFile(output_path.into()))?;
-        tokio::spawn(async move {
-            collect_data_points_json_file(&mut UnboundedReceiverStream::new(metrics_rx), &mut file)
+        tokio::spawn(
+            async move {
+                collect_data_points_json_file(
+                    &mut UnboundedReceiverStream::new(metrics_rx),
+                    &mut file,
+                )
                 .await
-        })
+            }
+            .instrument(metrics_span()),
+        )
     } else {
         tokio::spawn(
             async move {
                 let mut stream = UnboundedReceiverStream::new(metrics_rx);
                 while let Some(point) = stream.next().await {
-                    tracing::trace!(
-                        target: "wrk3::metrics",
-                        time = %point.timestamp,
-                        metric = point.metric,
-                        data = ?point.values,
-                    );
+                    trace_data_point(&point);
                 }
                 Ok(())
             }
-            .instrument(tracing::trace_span!(target: "wrk3::metrics", "metrics")),
+            .instrument(metrics_span()),
         )
     };
 
@@ -638,7 +719,7 @@ impl SteppedRateSchedule {
         for stage in script_stages {
             let duration = stage.duration.into();
             stages.push(Stage {
-                start_time,
+                start_time: stage_start,
                 duration,
                 request_delay: Duration::from_secs_f64(stage.rate.recip()),
             });
@@ -662,9 +743,13 @@ async fn run_schedule(
 ) -> anyhow::Result<()> {
     let mut iteration_num = 0;
 
+    Span::current().pb_set_length(100);
+
     while let Some(next_time) = schedule.next_event_time() {
         let num_events = schedule.advance(Instant::now());
         tracing::trace!(num_events);
+
+        Span::current().pb_set_position((schedule.progress() * 100.0) as u64);
 
         for _ in 0..num_events {
             let ts = Instant::now() - start_time;
@@ -702,11 +787,17 @@ fn main() -> anyhow::Result<()> {
 
     let args = parse_script_args(&script_name, &script, &cli.trailing)?;
 
-    println!("wrk3");
+    println!("{}", banner());
+
+    println!("Version: {}", version_string());
     println!();
 
-    for (key, value) in &args {
-        println!("{key} => {value}")
+    if !args.is_empty() {
+        println!("Script Args:");
+        for (key, value) in &args {
+            println!("  {key} => {value}")
+        }
+        println!();
     }
     println!();
 
@@ -714,14 +805,19 @@ fn main() -> anyhow::Result<()> {
         Arc::new(args.clone()),
         NamedSource::new(&script_name, &script),
     )?;
-    for stage in &config.stages {
-        println!("* {} {}req/s", stage.duration, stage.rate);
+    if !config.stages.is_empty() {
+        println!("Schedule:");
+        for stage in &config.stages {
+            println!("  * {} @ {}req/s", stage.duration, stage.rate);
+        }
+        println!();
     }
 
     let addr = resolve_connectable_address(&cli.host)
         .ok_or_else(|| anyhow!("failed to resolve address {}", cli.host))?;
 
-    println!("addr {addr}");
+    println!("Host: {} => {addr}", cli.host);
+    println!();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -755,6 +851,12 @@ fn main() -> anyhow::Result<()> {
                 let start_time = Instant::now();
                 pool.set_start_time(start_time);
 
+                Span::current().pb_set_style(
+                    &ProgressStyle::with_template("[{elapsed}] [{bar:50}] {percent}%")
+                        .expect("template should be valid")
+                        .progress_chars("=> "),
+                );
+
                 run_schedule(
                     start_time,
                     SteppedRateSchedule::new(start_time, config.stages),
@@ -768,7 +870,7 @@ fn main() -> anyhow::Result<()> {
 
                 Ok::<_, anyhow::Error>(())
             }
-            .instrument(tracing::trace_span!("schedule")),
+            .instrument(tracing::trace_span!("schedule", indicatif.pb_show = true)),
         )
         .await
         .unwrap()?;
