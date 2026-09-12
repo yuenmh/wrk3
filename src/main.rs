@@ -60,6 +60,10 @@ struct Cli {
     #[clap(long, short = 'o')]
     output: Option<PathBuf>,
 
+    /// Number of times to attempt dispatching each iteration to the pool of VUs
+    #[clap(long, default_value_t = 8)]
+    dispatch_attempts: usize,
+
     /// Args that will be passed to the script
     #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
     trailing: Vec<String>,
@@ -381,6 +385,7 @@ struct Script {
     source: String,
 }
 
+#[derive(Clone)]
 struct IterationInfo {
     num: usize,
 }
@@ -586,6 +591,28 @@ impl Dispatcher for RoundRobinDispatcher {
         };
         self.next = (self.next + 1).rem_euclid(pool.count());
         res
+    }
+}
+
+struct RetryDispatcher<D> {
+    inner: D,
+    max_iters: usize,
+}
+
+impl<D> Dispatcher for RetryDispatcher<D>
+where
+    D: Dispatcher,
+{
+    fn dispatch_iteration(&mut self, pool: &VuPool, info: IterationInfo) -> Result<DispatchOk, ()> {
+        for _ in 0..self.max_iters {
+            if matches!(
+                self.inner.dispatch_iteration(pool, info.clone())?,
+                DispatchOk::Started
+            ) {
+                return Ok(DispatchOk::Started);
+            }
+        }
+        Ok(DispatchOk::Skip)
     }
 }
 
@@ -867,7 +894,7 @@ fn main() -> anyhow::Result<()> {
                 pool.set_start_time(start_time);
 
                 Span::current().pb_set_style(
-                    &ProgressStyle::with_template("[{elapsed}] [{bar:50}] {percent}%")
+                    &ProgressStyle::with_template("[{elapsed_precise}] [{bar:50}] {percent}%")
                         .expect("template should be valid")
                         .progress_chars("=> "),
                 );
@@ -875,7 +902,10 @@ fn main() -> anyhow::Result<()> {
                 let schedule_res = run_schedule(
                     start_time,
                     SteppedRateSchedule::new(start_time, config.stages),
-                    RoundRobinDispatcher::default(),
+                    RetryDispatcher {
+                        inner: RoundRobinDispatcher::default(),
+                        max_iters: cli.dispatch_attempts,
+                    },
                     &pool,
                     metrics_tx,
                 )
