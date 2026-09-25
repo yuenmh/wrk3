@@ -271,6 +271,7 @@ fn script_request_to_http(host: &str, request: script::Request) -> Result<HttpRe
 
 struct ResponseInfo {
     status: u16,
+    body: hyper::body::Incoming,
 }
 
 enum ResponseError {
@@ -286,6 +287,7 @@ async fn handle_request_message(
     let result_fut = sender.send_request(request).map(|res| {
         res.map(|res| ResponseInfo {
             status: res.status().as_u16(),
+            body: res.into_body(),
         })
         .map_err(|_| ResponseError::Disconnected)
     });
@@ -302,6 +304,13 @@ async fn handle_request_message(
     } else {
         result_fut.await
     }
+}
+
+async fn discard_body(mut body: hyper::body::Incoming) -> Result<(), anyhow::Error> {
+    while let Some(frame) = body.frame().await {
+        let _ = frame?;
+    }
+    Ok(())
 }
 
 #[tracing::instrument(level = "trace", skip_all, ret)]
@@ -348,6 +357,14 @@ async fn handle_runtime_messages(
                 let request = script_request_to_http(host, request)?;
                 match handle_request_message(request, timeout, &mut sender).await {
                     Ok(resp) => {
+                        tokio::spawn(
+                            async move {
+                                discard_body(resp.body)
+                                    .await
+                                    .inspect_err(|err| tracing::trace!(%err))
+                            }
+                            .instrument(tracing::trace_span!("drain_body")),
+                        );
                         response
                             .send(script::Response {
                                 status: resp.status,
