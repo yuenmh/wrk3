@@ -10,10 +10,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, anyhow};
+use anyhow::{Context as _, anyhow, bail};
 use clap::{ArgAction, Parser};
 use crossbeam::atomic::AtomicCell;
-use futures::FutureExt as _;
+use futures::{FutureExt as _, StreamExt as _};
+use http_body_util::BodyExt;
 use hyper::{Request, client::conn::http1::SendRequest};
 use hyper_util::rt::TokioIo;
 use indicatif::ProgressStyle;
@@ -27,7 +28,7 @@ use tokio::{
     },
 };
 use tokio_stream::{
-    Stream, StreamExt,
+    Stream,
     wrappers::{ReceiverStream, UnboundedReceiverStream},
 };
 use tracing::{Instrument, Span, level_filters::LevelFilter};
@@ -43,8 +44,22 @@ mod script;
 shadow_rs::shadow!(build);
 
 #[derive(clap::Parser)]
-#[command(version = version_string_static())]
+#[clap(version = version_string_static())]
 struct Cli {
+    #[clap(subcommand)]
+    cmd: Command,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Run workload specified by a script
+    Run(RunCmd),
+    /// Execute a single request using the script
+    Request(RequestCmd),
+}
+
+#[derive(clap::Args)]
+struct RunCmd {
     /// Lua script that defines workload schedule and behavior
     script: PathBuf,
 
@@ -67,6 +82,24 @@ struct Cli {
     /// Args that will be passed to the script
     #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
     trailing: Vec<String>,
+}
+
+#[derive(clap::Args)]
+struct RequestCmd {
+    /// Lua script that defines request behavior
+    script: PathBuf,
+
+    /// Address to connect to
+    #[clap(long, short = 'H')]
+    host: String,
+
+    /// Args that will be passed to the script
+    #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
+    trailing: Vec<String>,
+
+    /// Seed for the Lua PRNG
+    #[clap(long, short = 's', default_value_t = 0)]
+    seed: u64,
 }
 
 fn banner() -> &'static str {
@@ -843,11 +876,19 @@ async fn run_schedule(
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+fn create_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name_fn(|| {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+            let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+            format!("worker-{id}")
+        })
+        .build()?;
+    Ok(runtime)
+}
 
-    setup_tracing()?;
-
+fn run_cmd(cli: RunCmd) -> anyhow::Result<()> {
     let script =
         std::fs::read_to_string(&cli.script).with_context(|| OpenFile(cli.script.clone()))?;
 
@@ -886,16 +927,7 @@ fn main() -> anyhow::Result<()> {
     println!("Host: {} => {addr}", cli.host);
     println!();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_name_fn(|| {
-            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-            let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-            format!("worker-{id}")
-        })
-        .build()?;
-
-    runtime.block_on(async {
+    create_runtime()?.block_on(async {
         let (metrics_jh, metrics_tx) = spawn_metrics_task(cli.output.as_deref()).await?;
 
         let pool = VuPool::spawn(
@@ -954,4 +986,125 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     Ok(())
+}
+
+async fn get_first_msg(
+    args: ArgsMap,
+    source: NamedSource<'_>,
+    seed: u64,
+) -> anyhow::Result<RuntimeMsg> {
+    let (metrics, metrics_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async {
+        UnboundedReceiverStream::new(metrics_rx)
+            .for_each(|_| async {})
+            .await;
+    });
+
+    let (sender, mut rx) = mpsc::channel(1);
+    let vu_state = VuState::new(
+        args,
+        source,
+        RuntimeState {
+            sender,
+            metrics,
+            start_time: Arc::new(AtomicCell::new(Instant::now())),
+        },
+    )?;
+
+    vu_state.seed_random(seed)?;
+    let complete_fut = vu_state.run_main(MainCtx { iteration: 0 });
+    let msg_fut = rx.recv();
+
+    let err_str = "main completed before causing any effects";
+    tokio::select! {
+        _ = complete_fut => bail!(err_str),
+        msg = msg_fut => Ok(msg.ok_or_else(|| anyhow!(err_str))?)
+    }
+}
+
+fn request_cmd(cli: RequestCmd) -> anyhow::Result<()> {
+    let script =
+        std::fs::read_to_string(&cli.script).with_context(|| OpenFile(cli.script.clone()))?;
+
+    let script_name = cli.script.to_string_lossy().to_string();
+
+    let args = parse_script_args(&script_name, &script, &cli.trailing)?;
+
+    let addr = resolve_connectable_address(&cli.host)
+        .ok_or_else(|| anyhow!("failed to resolve address {}", cli.host))?;
+    println!("* Resolved {} to {}", cli.host, addr);
+
+    create_runtime()?.block_on(async {
+        let first_msg = get_first_msg(
+            Arc::new(args),
+            NamedSource::new(&script_name, &script),
+            cli.seed,
+        )
+        .await?;
+
+        let request = match first_msg {
+            RuntimeMsg::Request { request, .. } => request,
+            _ => bail!("the first effect must be a request"),
+        };
+
+        let stream = TcpStream::connect(addr)
+            .await
+            .map_err(|e| FatalError::Connect(e.kind()))?;
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(FatalError::Handshake)?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        println!("* Connected to {addr}");
+
+        println!("> {} {}", request.method, request.path);
+        if let Some(map) = &request.headers {
+            for (k, v) in map {
+                println!("> {k}: {v}")
+            }
+        }
+        if let Some(body) = &request.body {
+            println!(">");
+            for line in body.lines() {
+                println!("> {line}");
+            }
+        }
+
+        let request = script_request_to_http(&cli.host, request)?;
+        let res = sender.send_request(request).await?;
+        println!("* Request sent");
+
+        println!(
+            "< {} {}",
+            res.status().as_u16(),
+            res.status().canonical_reason().unwrap_or("")
+        );
+        for (k, v) in res.headers() {
+            println!(
+                "< {}: {}",
+                k.as_str(),
+                String::from_utf8_lossy(v.as_bytes())
+            );
+        }
+        println!("<");
+        for line in String::from_utf8_lossy(&res.into_body().collect().await?.to_bytes()).lines() {
+            println!("< {line}");
+        }
+
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    setup_tracing()?;
+
+    let args = Cli::parse();
+
+    match args.cmd {
+        Command::Run(cli) => run_cmd(cli),
+        Command::Request(cli) => request_cmd(cli),
+    }
 }

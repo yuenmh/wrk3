@@ -400,6 +400,18 @@ impl_from_lua_table!(
     [timeout = |_| None],
 );
 
+impl std::fmt::Display for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Method::Get => write!(f, "GET"),
+            Method::Post => write!(f, "POST"),
+            Method::Put => write!(f, "PUT"),
+            Method::Delete => write!(f, "DELETE"),
+            Method::Patch => write!(f, "PATCH"),
+        }
+    }
+}
+
 pub enum ResponseError {
     TimedOut,
     Disconnected,
