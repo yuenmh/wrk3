@@ -591,9 +591,12 @@ struct HostInfo {
 
 type Http2Sender = hyper::client::conn::http2::SendRequest<String>;
 
-struct NewConnectionMsg {
-    resp: oneshot::Sender<Http2Sender>,
-    span: tracing::Span,
+enum H2PoolMsg {
+    NewConnection {
+        resp: oneshot::Sender<Http2Sender>,
+        span: tracing::Span,
+    },
+    Shutdown,
 }
 
 struct H2PoolOpts {
@@ -677,7 +680,7 @@ impl H2PoolState {
 }
 
 async fn run_h2_connection_pool(
-    new_connections: impl Stream<Item = NewConnectionMsg> + Unpin,
+    new_connections: impl Stream<Item = H2PoolMsg> + Unpin,
     start_time: Arc<AtomicCell<Instant>>,
     metrics: mpsc::UnboundedSender<DataPoint>,
     opts: H2PoolOpts,
@@ -695,24 +698,25 @@ async fn run_h2_connection_pool(
     };
 
     enum Msg {
-        New(NewConnectionMsg),
+        Pool(H2PoolMsg),
         Closed(slotmap::DefaultKey),
     }
 
     let mut msgs = futures::stream::select(
-        new_connections.map(Msg::New),
+        new_connections.map(Msg::Pool),
         ReceiverStream::new(closed_rx).map(Msg::Closed),
     );
 
     while let Some(msg) = msgs.next().await {
         match msg {
-            Msg::New(new) => {
+            Msg::Pool(H2PoolMsg::NewConnection { resp, span }) => {
                 let conn = state
                     .get_conn()
-                    .instrument(tracing::trace_span!(parent: new.span, "get_sender"))
+                    .instrument(tracing::trace_span!(parent: span, "get_sender"))
                     .await?;
-                let _ = new.resp.send(conn);
+                let _ = resp.send(conn);
             }
+            Msg::Pool(H2PoolMsg::Shutdown) => break,
             Msg::Closed(key) => {
                 state.closed(key);
             }
@@ -730,7 +734,7 @@ struct GlobalState {
 
 #[derive(Clone)]
 struct H2Pool {
-    sender: mpsc::Sender<NewConnectionMsg>,
+    sender: mpsc::Sender<H2PoolMsg>,
 }
 
 impl H2Pool {
@@ -755,7 +759,7 @@ impl H2Pool {
     pub async fn get_sender(&self) -> anyhow::Result<Http2Sender> {
         let (resp, resp_rx) = oneshot::channel();
         self.sender
-            .send(NewConnectionMsg {
+            .send(H2PoolMsg::NewConnection {
                 resp,
                 span: tracing::Span::current(),
             })
@@ -763,6 +767,13 @@ impl H2Pool {
             .map_err(|_| anyhow!("h2 pool task not running"))?;
         let sender = resp_rx.await?;
         Ok(sender)
+    }
+}
+
+impl Drop for H2Pool {
+    fn drop(&mut self) {
+        let sender = self.sender.clone();
+        tokio::spawn(async move { sender.send(H2PoolMsg::Shutdown).await });
     }
 }
 
