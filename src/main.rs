@@ -340,12 +340,38 @@ async fn discard_body(mut body: hyper::body::Incoming) -> Result<(), anyhow::Err
     Ok(())
 }
 
-async fn handle_request_msg(
+trait SenderLifetime {
+    fn control_flow_for_error(err: &ResponseError) -> ControlFlow<()>;
+}
+
+struct EndOnTimeoutAndDisconnect;
+
+impl SenderLifetime for EndOnTimeoutAndDisconnect {
+    fn control_flow_for_error(_err: &ResponseError) -> ControlFlow<()> {
+        ControlFlow::Break(())
+    }
+}
+
+struct EndOnDisconnectOnly;
+
+impl SenderLifetime for EndOnDisconnectOnly {
+    fn control_flow_for_error(err: &ResponseError) -> ControlFlow<()> {
+        match err {
+            ResponseError::Disconnected => ControlFlow::Break(()),
+            ResponseError::TimedOut => ControlFlow::Continue(()),
+        }
+    }
+}
+
+async fn handle_request_msg<L>(
     host: &str,
     request: script::Request,
     response: oneshot::Sender<script::Response>,
     sender: &mut impl SendRequest<String>,
-) -> Result<ControlFlow<ControlFlow<()>>, FatalError> {
+) -> Result<ControlFlow<()>, FatalError>
+where
+    L: SenderLifetime,
+{
     let timeout = request.timeout.map(Into::into);
     let request = script_request_to_http(host, request)?;
     match send_request(request, timeout, sender).await {
@@ -376,13 +402,14 @@ async fn handle_request_msg(
                     }),
                 })
                 .map_err(|_| FatalError::VuDisconnected)?;
-            Ok(ControlFlow::Break(ControlFlow::Continue(())))
+            Ok(L::control_flow_for_error(&e))
         }
     }
 }
 
 trait ConnectionPool {
     type Sender: SendRequest<String>;
+    type Lifetime: SenderLifetime;
 
     fn get_sender(&self) -> impl Future<Output = anyhow::Result<Self::Sender>> + Send;
 }
@@ -401,6 +428,7 @@ impl H1DummyPool {
 
 impl ConnectionPool for H1DummyPool {
     type Sender = Http1Sender;
+    type Lifetime = EndOnTimeoutAndDisconnect;
 
     async fn get_sender(&self) -> anyhow::Result<Self::Sender> {
         let stream = TcpStream::connect(self.addr)
@@ -456,9 +484,15 @@ where
     while let Some(message) = messages.next().await {
         match message {
             script::RuntimeMsg::Request { request, response } => {
-                match handle_request_msg(host, request, response, &mut sender).await? {
+                // I don't actually think this matters for http2 since the lifetime of
+                // the senders is managed by the pool rather than being tied to this function
+                // like it is for the http1 "pool". For http1 after DC or timeout the sender
+                // will be unusable so we need to end and let the outer loop call this function again
+                match handle_request_msg::<P::Lifetime>(host, request, response, &mut sender)
+                    .await?
+                {
                     ControlFlow::Continue(_) => {}
-                    ControlFlow::Break(cf) => return Ok(cf),
+                    ControlFlow::Break(_) => return Ok(ControlFlow::Continue(())),
                 }
             }
             script::RuntimeMsg::Sleep { duration, response } => {
@@ -807,6 +841,7 @@ impl SendRequest<String> for Http2Sender {
 
 impl ConnectionPool for H2Pool {
     type Sender = Http2Sender;
+    type Lifetime = EndOnDisconnectOnly;
 
     async fn get_sender(&self) -> anyhow::Result<Self::Sender> {
         self.get_sender().await
