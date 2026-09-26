@@ -15,8 +15,8 @@ use clap::{ArgAction, Parser};
 use crossbeam::atomic::AtomicCell;
 use futures::{FutureExt as _, StreamExt as _};
 use http_body_util::BodyExt;
-use hyper::{Request, client::conn::http1::SendRequest};
-use hyper_util::rt::TokioIo;
+use hyper::Request;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use indicatif::ProgressStyle;
 use rustc_hash::FxHashMap;
 use tokio::{
@@ -74,6 +74,14 @@ struct RunCmd {
     /// Output file for metrics
     #[clap(long, short = 'o')]
     output: Option<PathBuf>,
+
+    /// Use HTTP/2
+    #[clap(long, short = '2')]
+    http2: bool,
+
+    /// Number of connections to use if using HTTP/2. Defaults to the number of VUs
+    #[clap(long)]
+    http2_pool: Option<usize>,
 
     /// Number of times to attempt dispatching each iteration to the pool of VUs
     #[clap(long, default_value_t = 8)]
@@ -241,11 +249,13 @@ enum FatalError {
     Handshake(#[source] hyper::Error),
     #[error("request formatting")]
     RequestFormat(#[source] http::Error),
+    #[error("getting connection from pool")]
+    GetConnection(#[source] anyhow::Error),
 }
 
 type HttpRequest = http::Request<String>;
 
-type HttpSender = SendRequest<String>;
+type Http1Sender = hyper::client::conn::http1::SendRequest<String>;
 
 fn script_request_to_http(host: &str, request: script::Request) -> Result<HttpRequest, FatalError> {
     let mut b = Request::builder()
@@ -279,10 +289,26 @@ enum ResponseError {
     TimedOut,
 }
 
-async fn handle_request_message(
+trait SendRequest<B> {
+    fn send_request(
+        &mut self,
+        req: Request<B>,
+    ) -> impl Future<Output = hyper::Result<http::Response<hyper::body::Incoming>>> + Send;
+}
+
+impl SendRequest<String> for Http1Sender {
+    async fn send_request(
+        &mut self,
+        req: Request<String>,
+    ) -> hyper::Result<http::Response<hyper::body::Incoming>> {
+        self.send_request(req).await
+    }
+}
+
+async fn send_request(
     request: HttpRequest,
     timeout: Option<Duration>,
-    sender: &mut HttpSender,
+    sender: &mut impl SendRequest<String>,
 ) -> Result<ResponseInfo, ResponseError> {
     let result_fut = sender.send_request(request).map(|res| {
         res.map(|res| ResponseInfo {
@@ -313,79 +339,125 @@ async fn discard_body(mut body: hyper::body::Incoming) -> Result<(), anyhow::Err
     Ok(())
 }
 
-#[tracing::instrument(level = "trace", skip_all, ret)]
-async fn handle_runtime_messages(
+async fn handle_request_msg(
+    host: &str,
+    request: script::Request,
+    response: oneshot::Sender<script::Response>,
+    sender: &mut impl SendRequest<String>,
+) -> Result<ControlFlow<ControlFlow<()>>, FatalError> {
+    let timeout = request.timeout.map(Into::into);
+    let request = script_request_to_http(host, request)?;
+    match send_request(request, timeout, sender).await {
+        Ok(resp) => {
+            tokio::spawn(
+                async move {
+                    discard_body(resp.body)
+                        .await
+                        .inspect_err(|err| tracing::trace!(%err))
+                }
+                .instrument(tracing::trace_span!("drain_body")),
+            );
+            response
+                .send(script::Response {
+                    status: resp.status,
+                    error: None,
+                })
+                .map_err(|_| FatalError::VuDisconnected)?;
+            Ok(ControlFlow::Continue(()))
+        }
+        Err(e) => {
+            response
+                .send(script::Response {
+                    status: 0,
+                    error: Some(match e {
+                        ResponseError::Disconnected => script::ResponseError::Disconnected,
+                        ResponseError::TimedOut => script::ResponseError::TimedOut,
+                    }),
+                })
+                .map_err(|_| FatalError::VuDisconnected)?;
+            Ok(ControlFlow::Break(ControlFlow::Continue(())))
+        }
+    }
+}
+
+trait ConnectionPool {
+    type Sender: SendRequest<String>;
+
+    fn get_sender(&self) -> impl Future<Output = anyhow::Result<Self::Sender>> + Send;
+}
+
+#[derive(Clone)]
+struct H1DummyPool {
     addr: SocketAddr,
+    global_state: GlobalState,
+}
+
+impl H1DummyPool {
+    pub fn new(addr: SocketAddr, global_state: GlobalState) -> Self {
+        Self { addr, global_state }
+    }
+}
+
+impl ConnectionPool for H1DummyPool {
+    type Sender = Http1Sender;
+
+    async fn get_sender(&self) -> anyhow::Result<Self::Sender> {
+        let stream = TcpStream::connect(self.addr)
+            .await
+            .map_err(|e| FatalError::Connect(e.kind()))?;
+        let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(FatalError::Handshake)?;
+
+        let metrics = self.global_state.metrics.clone();
+        let start_time = self.global_state.start_time.clone();
+
+        metrics
+            .send(data_point!(
+                Instant::now() - start_time.load(),
+                "wrk3.tcp_connections.d",
+                value = Int(1)
+            ))
+            .map_err(|_| FatalError::MetricsDisconnected)?;
+
+        tokio::spawn(
+            async move {
+                let _ = conn.await.inspect_err(|err| {
+                    tracing::trace!(%err);
+                });
+                let _ = metrics.send(data_point!(
+                    Instant::now() - start_time.load(),
+                    "wrk3.tcp_disconnections.d",
+                    value = Int(1)
+                ));
+            }
+            .instrument(tracing::trace_span!("conn")),
+        );
+
+        Ok(sender)
+    }
+}
+
+#[tracing::instrument(level = "trace", skip_all, ret)]
+async fn handle_runtime_messages<P>(
+    connection_pool: &P,
     messages: &mut (impl Stream<Item = RuntimeMsg> + Unpin),
     host: &str,
-    start_time: Arc<AtomicCell<Instant>>,
-    metrics: mpsc::UnboundedSender<DataPoint>,
-) -> Result<ControlFlow<()>, FatalError> {
-    let stream = TcpStream::connect(addr)
+) -> Result<ControlFlow<()>, FatalError>
+where
+    P: ConnectionPool,
+{
+    let mut sender = connection_pool
+        .get_sender()
         .await
-        .map_err(|e| FatalError::Connect(e.kind()))?;
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .map_err(FatalError::Handshake)?;
-
-    metrics
-        .send(data_point!(
-            Instant::now() - start_time.load(),
-            "wrk3.tcp_connections.d",
-            value = Int(1)
-        ))
-        .map_err(|_| FatalError::MetricsDisconnected)?;
-
-    tokio::spawn(
-        async move {
-            let _ = conn.await.inspect_err(|err| {
-                tracing::trace!(%err);
-            });
-            let _ = metrics.send(data_point!(
-                Instant::now() - start_time.load(),
-                "wrk3.tcp_disconnections.d",
-                value = Int(1)
-            ));
-        }
-        .instrument(tracing::trace_span!("conn")),
-    );
+        .map_err(FatalError::GetConnection)?;
 
     while let Some(message) = messages.next().await {
         match message {
             script::RuntimeMsg::Request { request, response } => {
-                let timeout = request.timeout.map(Into::into);
-                let request = script_request_to_http(host, request)?;
-                match handle_request_message(request, timeout, &mut sender).await {
-                    Ok(resp) => {
-                        tokio::spawn(
-                            async move {
-                                discard_body(resp.body)
-                                    .await
-                                    .inspect_err(|err| tracing::trace!(%err))
-                            }
-                            .instrument(tracing::trace_span!("drain_body")),
-                        );
-                        response
-                            .send(script::Response {
-                                status: resp.status,
-                                error: None,
-                            })
-                            .map_err(|_| FatalError::VuDisconnected)?;
-                    }
-                    Err(e) => {
-                        response
-                            .send(script::Response {
-                                status: 0,
-                                error: Some(match e {
-                                    ResponseError::Disconnected => {
-                                        script::ResponseError::Disconnected
-                                    }
-                                    ResponseError::TimedOut => script::ResponseError::TimedOut,
-                                }),
-                            })
-                            .map_err(|_| FatalError::VuDisconnected)?;
-                        return Ok(ControlFlow::Continue(()));
-                    }
+                match handle_request_msg(host, request, response, &mut sender).await? {
+                    ControlFlow::Continue(_) => {}
+                    ControlFlow::Break(cf) => return Ok(cf),
                 }
             }
             script::RuntimeMsg::Sleep { duration, response } => {
@@ -398,17 +470,16 @@ async fn handle_runtime_messages(
     Ok(ControlFlow::Break(()))
 }
 
-async fn reactor_loop(
-    addr: SocketAddr,
+async fn reactor_loop<P>(
+    connection_pool: &P,
     messages: &mut (impl Stream<Item = RuntimeMsg> + Unpin),
     host: &str,
-    start_time: Arc<AtomicCell<Instant>>,
-    metrics: mpsc::UnboundedSender<DataPoint>,
-) -> Result<(), FatalError> {
+) -> Result<(), FatalError>
+where
+    P: ConnectionPool,
+{
     loop {
-        match handle_runtime_messages(addr, messages, host, start_time.clone(), metrics.clone())
-            .await?
-        {
+        match handle_runtime_messages(connection_pool, messages, host).await? {
             ControlFlow::Continue(_) => {}
             ControlFlow::Break(_) => break Ok(()),
         }
@@ -518,6 +589,200 @@ struct HostInfo {
     host: Arc<str>,
 }
 
+type Http2Sender = hyper::client::conn::http2::SendRequest<String>;
+
+struct NewConnectionMsg {
+    resp: oneshot::Sender<Http2Sender>,
+    span: tracing::Span,
+}
+
+struct H2PoolOpts {
+    max_size: usize,
+    addr: SocketAddr,
+}
+
+struct H2PoolState {
+    addr: SocketAddr,
+    max_size: usize,
+    senders: slotmap::SlotMap<slotmap::DefaultKey, Http2Sender>,
+    keys: VecDeque<slotmap::DefaultKey>,
+    closed_tx: mpsc::Sender<slotmap::DefaultKey>,
+    metrics: mpsc::UnboundedSender<DataPoint>,
+    start_time: Arc<AtomicCell<Instant>>,
+}
+
+impl H2PoolState {
+    fn closed(&mut self, key: slotmap::DefaultKey) {
+        self.senders.remove(key);
+    }
+
+    async fn open_new(&mut self) -> Result<Http2Sender, FatalError> {
+        let stream = TcpStream::connect(self.addr)
+            .await
+            .map_err(|e| FatalError::Connect(e.kind()))?;
+        let (sender, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                .await
+                .map_err(FatalError::Handshake)?;
+        let key = self.senders.insert(sender.clone());
+        self.keys.push_back(key);
+
+        self.metrics
+            .send(data_point!(
+                Instant::now() - self.start_time.load(),
+                "wrk3.tcp_connections.d",
+                value = Int(1)
+            ))
+            .map_err(|_| FatalError::MetricsDisconnected)?;
+
+        let metrics = self.metrics.clone();
+        let start_time = self.start_time.clone();
+        let closed_tx = self.closed_tx.clone();
+        tokio::spawn(
+            async move {
+                let _ = conn.await.inspect_err(|err| {
+                    tracing::trace!(%err);
+                });
+                let _ = metrics.send(data_point!(
+                    Instant::now() - start_time.load(),
+                    "wrk3.tcp_disconnections.d",
+                    value = Int(1)
+                ));
+                let _ = closed_tx.send(key).await;
+            }
+            .instrument(tracing::trace_span!("conn")),
+        );
+        Ok(sender)
+    }
+
+    fn next_conn(&mut self) -> Option<Http2Sender> {
+        while let Some(key) = self.keys.pop_front() {
+            if let Some(sender) = self.senders.get(key) {
+                self.keys.push_back(key);
+                return Some(sender.clone());
+            }
+            // keys which correspond to closed connections don't get re-queued
+        }
+        None
+    }
+
+    async fn get_conn(&mut self) -> Result<Http2Sender, FatalError> {
+        if self.senders.len() >= self.max_size {
+            tracing::trace!("reusing connection");
+            return Ok(self.next_conn().expect("senders is not empty"));
+        }
+        tracing::trace!("opening new connection");
+        self.open_new().await
+    }
+}
+
+async fn run_h2_connection_pool(
+    new_connections: impl Stream<Item = NewConnectionMsg> + Unpin,
+    start_time: Arc<AtomicCell<Instant>>,
+    metrics: mpsc::UnboundedSender<DataPoint>,
+    opts: H2PoolOpts,
+) -> anyhow::Result<()> {
+    let (closed_tx, closed_rx) = mpsc::channel(1);
+
+    let mut state = H2PoolState {
+        addr: opts.addr,
+        max_size: opts.max_size,
+        senders: Default::default(),
+        keys: Default::default(),
+        closed_tx,
+        metrics,
+        start_time,
+    };
+
+    enum Msg {
+        New(NewConnectionMsg),
+        Closed(slotmap::DefaultKey),
+    }
+
+    let mut msgs = futures::stream::select(
+        new_connections.map(Msg::New),
+        ReceiverStream::new(closed_rx).map(Msg::Closed),
+    );
+
+    while let Some(msg) = msgs.next().await {
+        match msg {
+            Msg::New(new) => {
+                let conn = state
+                    .get_conn()
+                    .instrument(tracing::trace_span!(parent: new.span, "get_sender"))
+                    .await?;
+                let _ = new.resp.send(conn);
+            }
+            Msg::Closed(key) => {
+                state.closed(key);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+struct GlobalState {
+    start_time: Arc<AtomicCell<Instant>>,
+    metrics: mpsc::UnboundedSender<DataPoint>,
+}
+
+#[derive(Clone)]
+struct H2Pool {
+    sender: mpsc::Sender<NewConnectionMsg>,
+}
+
+impl H2Pool {
+    pub fn new(opts: H2PoolOpts, global_state: GlobalState) -> Self {
+        let (msg_tx, msg_rx) = mpsc::channel(1);
+        tokio::spawn(
+            async move {
+                run_h2_connection_pool(
+                    ReceiverStream::new(msg_rx),
+                    global_state.start_time,
+                    global_state.metrics,
+                    opts,
+                )
+                .await
+                .inspect_err(|err| tracing::trace!(%err))
+            }
+            .instrument(tracing::trace_span!("h2_pool")),
+        );
+        Self { sender: msg_tx }
+    }
+
+    pub async fn get_sender(&self) -> anyhow::Result<Http2Sender> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.sender
+            .send(NewConnectionMsg {
+                resp,
+                span: tracing::Span::current(),
+            })
+            .await
+            .map_err(|_| anyhow!("h2 pool task not running"))?;
+        let sender = resp_rx.await?;
+        Ok(sender)
+    }
+}
+
+impl SendRequest<String> for Http2Sender {
+    async fn send_request(
+        &mut self,
+        req: Request<String>,
+    ) -> hyper::Result<http::Response<hyper::body::Incoming>> {
+        self.send_request(req).await
+    }
+}
+
+impl ConnectionPool for H2Pool {
+    type Sender = Http2Sender;
+
+    async fn get_sender(&self) -> anyhow::Result<Self::Sender> {
+        self.get_sender().await
+    }
+}
+
 struct VuPool {
     start_time: Arc<AtomicCell<Instant>>,
     input_channels: Vec<mpsc::Sender<IterationInfo>>,
@@ -525,14 +790,19 @@ struct VuPool {
 }
 
 impl VuPool {
-    async fn spawn(
+    async fn spawn<P>(
         num: usize,
         host: HostInfo,
-        metrics: mpsc::UnboundedSender<DataPoint>,
+        connection_pool: P,
+        global_state: GlobalState,
         args: ArgsMap,
         script: Arc<Script>,
-    ) -> Self {
-        let start_time = Arc::new(AtomicCell::new(Instant::now()));
+    ) -> Self
+    where
+        P: ConnectionPool + Clone + Send + Sync + 'static,
+        P::Sender: Send,
+    {
+        let start_time = global_state.start_time.clone();
         let mut input_channels = Vec::new();
         let mut vu_handles = Vec::new();
 
@@ -544,8 +814,9 @@ impl VuPool {
 
             let args = args.clone();
             let script = script.clone();
-            let metrics = metrics.clone();
+            let metrics = global_state.metrics.clone();
             let start_time = start_time.clone();
+            let connection_pool = connection_pool.clone();
 
             let (vu_signal_tx, vu_signal_rx) = oneshot::channel();
             let (reactor_signal_tx, reactor_signal_rx) = oneshot::channel();
@@ -576,15 +847,9 @@ impl VuPool {
                     });
                     let reactor_jh = tokio::spawn(
                         async move {
+                            let a = connection_pool;
                             reactor_signal_tx.send(()).unwrap();
-                            reactor_loop(
-                                host.addr,
-                                &mut ReceiverStream::new(runtime_rx),
-                                &host.host,
-                                start_time,
-                                metrics,
-                            )
-                            .await
+                            reactor_loop(&a, &mut ReceiverStream::new(runtime_rx), &host.host).await
                         }
                         .instrument(tracing::trace_span!("reactor", addr = %host.addr)),
                     );
@@ -942,25 +1207,56 @@ fn run_cmd(cli: RunCmd) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow!("failed to resolve address {}", cli.host))?;
 
     println!("Host: {} => {addr}", cli.host);
+    println!("Proto: {}", if cli.http2 { "HTTP/2" } else { "HTTP/1.1" });
     println!();
 
     create_runtime()?.block_on(async {
         let (metrics_jh, metrics_tx) = spawn_metrics_task(cli.output.as_deref()).await?;
 
-        let pool = VuPool::spawn(
-            cli.vus,
-            HostInfo {
-                addr,
-                host: cli.host.into(),
-            },
-            metrics_tx.clone(),
-            Arc::new(args),
-            Arc::new(Script {
-                name: script_name,
-                source: script,
-            }),
-        )
-        .await;
+        let global_state = GlobalState {
+            metrics: metrics_tx.clone(),
+            start_time: Arc::new(AtomicCell::new(Instant::now())),
+        };
+
+        let pool = if cli.http2 {
+            VuPool::spawn(
+                cli.vus,
+                HostInfo {
+                    addr,
+                    host: cli.host.into(),
+                },
+                H2Pool::new(
+                    H2PoolOpts {
+                        addr,
+                        max_size: cli.http2_pool.unwrap_or(cli.vus),
+                    },
+                    global_state.clone(),
+                ),
+                global_state,
+                Arc::new(args),
+                Arc::new(Script {
+                    name: script_name,
+                    source: script,
+                }),
+            )
+            .await
+        } else {
+            VuPool::spawn(
+                cli.vus,
+                HostInfo {
+                    addr,
+                    host: cli.host.into(),
+                },
+                H1DummyPool::new(addr, global_state.clone()),
+                global_state,
+                Arc::new(args),
+                Arc::new(Script {
+                    name: script_name,
+                    source: script,
+                }),
+            )
+            .await
+        };
 
         tokio::spawn(
             async move {
@@ -1067,9 +1363,10 @@ fn request_cmd(cli: RequestCmd) -> anyhow::Result<()> {
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| FatalError::Connect(e.kind()))?;
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .map_err(FatalError::Handshake)?;
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                .await
+                .map_err(FatalError::Handshake)?;
         tokio::spawn(async move {
             let _ = conn.await;
         });
