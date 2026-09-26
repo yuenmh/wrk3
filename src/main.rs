@@ -3,6 +3,7 @@ use std::{
     net::{SocketAddr, ToSocketAddrs as _},
     ops::ControlFlow,
     path::{Path, PathBuf},
+    pin::pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -596,7 +597,6 @@ enum H2PoolMsg {
         resp: oneshot::Sender<Http2Sender>,
         span: tracing::Span,
     },
-    Shutdown,
 }
 
 struct H2PoolOpts {
@@ -679,6 +679,27 @@ impl H2PoolState {
     }
 }
 
+/// Like [futures::stream::select], but it ends when the first stream ends
+fn select_shorter<T>(
+    mut a: impl Stream<Item = T> + Unpin,
+    mut b: impl Stream<Item = T> + Unpin,
+) -> impl Stream<Item = T> {
+    async_stream::stream! {
+        loop {
+            tokio::select! {
+                next = a.next() => match next {
+                    Some(item) => yield item,
+                    None => break,
+                },
+                next = b.next() => match next {
+                    Some(item) => yield item,
+                    None => break,
+                },
+            }
+        }
+    }
+}
+
 async fn run_h2_connection_pool(
     new_connections: impl Stream<Item = H2PoolMsg> + Unpin,
     start_time: Arc<AtomicCell<Instant>>,
@@ -702,22 +723,27 @@ async fn run_h2_connection_pool(
         Closed(slotmap::DefaultKey),
     }
 
-    let mut msgs = futures::stream::select(
+    // normal select doesn't work here because we need to shut down once the
+    // main message sender (in the handle) is dropped. the closed notification channel is kept
+    // alive forever, and normal select ends after both streams end.
+    let mut msgs = pin!(select_shorter(
         new_connections.map(Msg::Pool),
         ReceiverStream::new(closed_rx).map(Msg::Closed),
-    );
+    ));
 
     while let Some(msg) = msgs.next().await {
         match msg {
             Msg::Pool(H2PoolMsg::NewConnection { resp, span }) => {
+                tracing::trace!("request connection");
                 let conn = state
                     .get_conn()
                     .instrument(tracing::trace_span!(parent: span, "get_sender"))
-                    .await?;
+                    .await
+                    .inspect_err(|err| tracing::trace!(%err, "get_conn error"))?;
                 let _ = resp.send(conn);
             }
-            Msg::Pool(H2PoolMsg::Shutdown) => break,
             Msg::Closed(key) => {
+                tracing::trace!("close connection");
                 state.closed(key);
             }
         }
@@ -749,7 +775,7 @@ impl H2Pool {
                     opts,
                 )
                 .await
-                .inspect_err(|err| tracing::trace!(%err))
+                .inspect_err(|err| tracing::trace!(%err, "h2_pool error"))
             }
             .instrument(tracing::trace_span!("h2_pool")),
         );
@@ -767,13 +793,6 @@ impl H2Pool {
             .map_err(|_| anyhow!("h2 pool task not running"))?;
         let sender = resp_rx.await?;
         Ok(sender)
-    }
-}
-
-impl Drop for H2Pool {
-    fn drop(&mut self) {
-        let sender = self.sender.clone();
-        tokio::spawn(async move { sender.send(H2PoolMsg::Shutdown).await });
     }
 }
 
@@ -858,9 +877,14 @@ impl VuPool {
                     });
                     let reactor_jh = tokio::spawn(
                         async move {
-                            let a = connection_pool;
                             reactor_signal_tx.send(()).unwrap();
-                            reactor_loop(&a, &mut ReceiverStream::new(runtime_rx), &host.host).await
+                            reactor_loop(
+                                &connection_pool,
+                                &mut ReceiverStream::new(runtime_rx),
+                                &host.host,
+                            )
+                            .await
+                            .inspect_err(|err| tracing::error!(%err))
                         }
                         .instrument(tracing::trace_span!("reactor", addr = %host.addr)),
                     );
