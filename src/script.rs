@@ -920,7 +920,7 @@ mod tests {
         )
         .unwrap();
         insta::assert_debug_snapshot!(config, @r#"
-        Config {
+        WorkloadConfig {
             stages: [
                 Stage {
                     duration: LuaDt(
