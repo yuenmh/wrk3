@@ -36,8 +36,8 @@ use tracing::{Instrument, Span, level_filters::LevelFilter};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::script::{
-    ArgTy, ArgsMap, DataPoint, LuaDt, MainCtx, MetricData, NamedSource, RuntimeMsg, RuntimeState,
-    VuState, data_point, load_config, trace_args,
+    ArgTy, ArgValue, ArgsMap, DataPoint, ExpectedArg, LuaDt, MainCtx, MetricData, NamedSource,
+    RuntimeMsg, RuntimeState, VuState, data_point, load_config, trace_args,
 };
 
 mod script;
@@ -175,34 +175,38 @@ fn setup_tracing() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_script_args(
-    script_path: &str,
-    script: &str,
-    args: &Vec<String>,
-) -> anyhow::Result<FxHashMap<String, String>> {
-    let param_schema = trace_args(script)?;
+fn negated_flag_name(name: &str) -> String {
+    name.strip_prefix("no-")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("no-{name}"))
+}
 
-    let mut cmd = clap::Command::new(script_path.to_string())
-        .no_binary_name(true)
-        .ignore_errors(true)
-        .allow_external_subcommands(true);
-    for param in &param_schema {
+fn script_arg_schema(script: &str) -> anyhow::Result<Vec<ExpectedArg>> {
+    let mut seen = rustc_hash::FxHashSet::default();
+    Ok(trace_args(script)?
+        .into_iter()
+        .filter(|param| seen.insert(param.name.clone()))
+        .collect())
+}
+
+fn script_args_command(script_path: &str, param_schema: &[ExpectedArg]) -> clap::Command {
+    let mut cmd = clap::Command::new(script_path.to_string()).no_binary_name(true);
+    for param in param_schema {
         if matches!(param.ty, ArgTy::Bool) {
-            cmd = cmd.arg(
-                clap::Arg::new(&param.name)
-                    .long(&param.name)
-                    .action(ArgAction::SetTrue),
-            );
-            let negated_name = param
-                .name
-                .strip_prefix("no-")
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("no-{}", param.name));
-            cmd = cmd.arg(
-                clap::Arg::new(negated_name)
-                    .long(&param.name)
-                    .action(ArgAction::SetFalse),
-            );
+            let negated_name = negated_flag_name(&param.name);
+            cmd = cmd
+                .arg(
+                    clap::Arg::new(&param.name)
+                        .long(&param.name)
+                        .action(ArgAction::SetTrue)
+                        .overrides_with(&negated_name),
+                )
+                .arg(
+                    clap::Arg::new(&negated_name)
+                        .long(&negated_name)
+                        .action(ArgAction::SetTrue)
+                        .overrides_with(&param.name),
+                );
         } else {
             let mut arg = clap::Arg::new(&param.name).long(&param.name);
             if let Some(default) = &param.default_value {
@@ -211,25 +215,41 @@ fn parse_script_args(
             cmd = cmd.arg(arg);
         }
     }
+    cmd
+}
 
-    let matches = cmd.get_matches_from(args);
-
+fn script_args_from_matches(
+    param_schema: &[ExpectedArg],
+    matches: &clap::ArgMatches,
+) -> FxHashMap<String, String> {
     let mut args = FxHashMap::default();
 
     for param in param_schema {
         if matches!(param.ty, ArgTy::Bool) {
-            args.insert(
-                param.name.clone(),
-                matches.get_flag(&param.name).to_string(),
-            );
-        } else {
-            if let Some(value) = matches.get_one::<String>(&param.name) {
-                args.insert(param.name.clone(), value.clone());
-            }
+            let value = if matches.get_flag(&negated_flag_name(&param.name)) {
+                false
+            } else if matches.get_flag(&param.name) {
+                true
+            } else {
+                matches!(param.default_value, Some(ArgValue::Bool(true)))
+            };
+            args.insert(param.name.clone(), value.to_string());
+        } else if let Some(value) = matches.get_one::<String>(&param.name) {
+            args.insert(param.name.clone(), value.clone());
         }
     }
 
-    Ok(args)
+    args
+}
+
+fn parse_script_args(
+    script_path: &str,
+    script: &str,
+    args: &Vec<String>,
+) -> anyhow::Result<FxHashMap<String, String>> {
+    let param_schema = script_arg_schema(script)?;
+    let matches = script_args_command(script_path, &param_schema).get_matches_from(args);
+    Ok(script_args_from_matches(&param_schema, &matches))
 }
 
 fn resolve_connectable_address(addr: &str) -> Option<SocketAddr> {
@@ -1490,5 +1510,52 @@ fn main() -> anyhow::Result<()> {
     match args.cmd {
         Command::Run(cli) => run_cmd(cli),
         Command::Request(cli) => request_cmd(cli),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCRIPT: &str = "
+        local w = require 'wrk3'
+        w.args.dt('duration', { default = '10s' })
+        w.args.bool 'verbose'
+        w.args.bool('keepalive', { default = true })
+        w.args.int 'rate'
+        w.args.int 'rate'
+    ";
+
+    fn try_parse(args: &[&str]) -> Result<FxHashMap<String, String>, clap::Error> {
+        let schema = script_arg_schema(SCRIPT).unwrap();
+        let matches = script_args_command("test.lua", &schema).try_get_matches_from(args)?;
+        Ok(script_args_from_matches(&schema, &matches))
+    }
+
+    #[test]
+    fn rejects_unknown_script_args() {
+        assert!(try_parse(&["--duraton", "5s"]).is_err());
+        assert!(try_parse(&["positional"]).is_err());
+    }
+
+    #[test]
+    fn parses_script_args() {
+        let args = try_parse(&["--rate", "100"]).unwrap();
+        assert_eq!(args["rate"], "100");
+        assert_eq!(args["duration"], "10s");
+        assert_eq!(args["verbose"], "false");
+        assert_eq!(args["keepalive"], "true");
+    }
+
+    #[test]
+    fn parses_bool_script_args() {
+        let args = try_parse(&["--verbose", "--no-keepalive"]).unwrap();
+        assert_eq!(args["verbose"], "true");
+        assert_eq!(args["keepalive"], "false");
+
+        let args =
+            try_parse(&["--verbose", "--no-verbose", "--no-keepalive", "--keepalive"]).unwrap();
+        assert_eq!(args["verbose"], "false");
+        assert_eq!(args["keepalive"], "true");
     }
 }
