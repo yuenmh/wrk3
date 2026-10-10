@@ -585,6 +585,7 @@ struct Script {
 #[derive(Clone)]
 struct IterationInfo {
     num: usize,
+    scheduled_duration_since_start: Duration,
 }
 
 async fn vu_loop(
@@ -615,6 +616,7 @@ async fn vu_loop(
         state
             .run_main(MainCtx {
                 iteration: info.num,
+                scheduled_start: info.scheduled_duration_since_start.into(),
             })
             .await?;
 
@@ -1148,8 +1150,9 @@ struct SteppedRateSchedule {
 }
 
 trait Schedule {
-    /// Advance the current time and determine how many events were supposed to have taken place
-    fn advance(&mut self, now: Instant) -> usize;
+    /// Advance the current time and emit scheduled times of the events that were
+    /// supposed to have taken place since the last call
+    fn advance(&mut self, now: Instant, events: &mut Vec<Instant>);
 
     fn next_event_time(&mut self) -> Option<Instant>;
 
@@ -1157,11 +1160,10 @@ trait Schedule {
 }
 
 impl Schedule for SteppedRateSchedule {
-    fn advance(&mut self, now: Instant) -> usize {
-        let mut events = 0;
+    fn advance(&mut self, now: Instant, events: &mut Vec<Instant>) {
         while let Some(stage) = self.stages.front_mut() {
             let due = stage.events_due(now);
-            events += due - stage.emitted;
+            events.extend((stage.emitted + 1..=due).map(|n| stage.nth_event_time(n)));
             stage.emitted = due;
 
             if now < stage.end_time() {
@@ -1170,7 +1172,6 @@ impl Schedule for SteppedRateSchedule {
             self.stages.pop_front();
         }
         self.current_time = now;
-        events
     }
 
     fn next_event_time(&mut self) -> Option<Instant> {
@@ -1218,20 +1219,27 @@ async fn run_schedule(
     metrics: mpsc::UnboundedSender<DataPoint>,
 ) -> anyhow::Result<()> {
     let mut iteration_num = 0;
+    let mut events = Vec::new();
 
     Span::current().pb_set_length(100);
 
     while let Some(next_time) = schedule.next_event_time() {
-        let num_events = schedule.advance(Instant::now());
-        tracing::trace!(num_events);
+        schedule.advance(Instant::now(), &mut events);
+        tracing::trace!(num_events = events.len());
 
         Span::current().pb_set_position((schedule.progress() * 100.0) as u64);
 
-        for _ in 0..num_events {
-            let ts = Instant::now() - start_time;
+        for scheduled in events.drain(..) {
+            let ts = scheduled - start_time;
 
             let res = dispatcher
-                .dispatch_iteration(pool, IterationInfo { num: iteration_num })
+                .dispatch_iteration(
+                    pool,
+                    IterationInfo {
+                        num: iteration_num,
+                        scheduled_duration_since_start: ts,
+                    },
+                )
                 .map_err(|_| anyhow!("vu failed"))?;
 
             metrics.send(data_point!(ts, "wrk3.iterations.d", value = Int(1)))?;
@@ -1424,7 +1432,10 @@ async fn get_first_msg(
     )?;
 
     vu_state.seed_random(seed)?;
-    let complete_fut = vu_state.run_main(MainCtx { iteration: 0 });
+    let complete_fut = vu_state.run_main(MainCtx {
+        iteration: 0,
+        scheduled_start: Duration::ZERO.into(),
+    });
     let msg_fut = rx.recv();
 
     let err_str = "main completed before causing any effects";
@@ -1556,9 +1567,11 @@ mod tests {
         let mut schedule = SteppedRateSchedule::new(start, stages);
         let mut now = start;
         let mut events = Vec::new();
+        let mut due = Vec::new();
         while let Some(next_time) = schedule.next_event_time() {
-            let due = schedule.advance(now);
-            events.extend(iter::repeat_n((now - start).as_secs_f64(), due));
+            schedule.advance(now, &mut due);
+            events.extend(iter::repeat_n((now - start).as_secs_f64(), due.len()));
+            due.clear();
             // it can get stuck on the < comparison if we don't do this
             now = cmp::max(now + Duration::from_nanos(1), next_time);
         }

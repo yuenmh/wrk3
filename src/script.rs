@@ -780,11 +780,13 @@ pub struct VuState {
 
 pub struct MainCtx {
     pub iteration: usize,
+    pub scheduled_start: LuaDt,
 }
 
 impl mlua::UserData for MainCtx {
     fn add_fields<F: mlua::prelude::LuaUserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("iteration", |_, this| Ok(this.iteration));
+        fields.add_field_method_get("scheduled_start", |_, this| Ok(this.scheduled_start));
     }
 }
 
