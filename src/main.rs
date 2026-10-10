@@ -1112,7 +1112,8 @@ struct OpenFile(PathBuf);
 struct Stage {
     start_time: Instant,
     duration: Duration,
-    request_delay: Duration,
+    rate: f64,
+    offset: f64,
     emitted: usize,
 }
 
@@ -1121,8 +1122,13 @@ impl Stage {
         self.start_time + self.duration
     }
 
+    /// Time of the nth event, clamped to the end of the stage
     fn nth_event_time(&self, n: usize) -> Instant {
-        self.start_time + (n as u32 * self.request_delay)
+        if self.rate <= 0.0 {
+            return self.end_time();
+        }
+        let offset = Duration::from_secs_f64((n as f64 - self.offset) / self.rate);
+        std::cmp::min(self.start_time + offset, self.end_time())
     }
 
     fn events_due(&self, now: Instant) -> usize {
@@ -1130,7 +1136,7 @@ impl Stage {
         if now <= self.start_time {
             return 0;
         }
-        ((now - self.start_time).as_secs_f64() / self.request_delay.as_secs_f64()) as usize
+        (self.offset + (now - self.start_time).as_secs_f64() * self.rate) as usize
     }
 }
 
@@ -1182,15 +1188,18 @@ impl SteppedRateSchedule {
     fn new(start_time: Instant, script_stages: impl IntoIterator<Item = script::Stage>) -> Self {
         let mut stages = Vec::new();
         let mut stage_start = start_time;
+        let mut offset = 0.0;
         for stage in script_stages {
-            let duration = stage.duration.into();
+            let duration: Duration = stage.duration.into();
             stages.push(Stage {
                 start_time: stage_start,
                 duration,
-                request_delay: Duration::from_secs_f64(stage.rate.recip()),
+                rate: stage.rate,
+                offset,
                 emitted: 0,
             });
             stage_start += duration;
+            offset = (offset + duration.as_secs_f64() * stage.rate).fract();
         }
         Self {
             current_time: start_time,
@@ -1515,6 +1524,8 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{cmp, iter};
+
     use super::*;
 
     const SCRIPT: &str = "
@@ -1530,6 +1541,69 @@ mod tests {
         let schema = script_arg_schema(SCRIPT).unwrap();
         let matches = script_args_command("test.lua", &schema).try_get_matches_from(args)?;
         Ok(script_args_from_matches(&schema, &matches))
+    }
+
+    fn stage(duration: &str, rate: f64) -> script::Stage {
+        script::Stage {
+            duration: duration.parse().unwrap(),
+            rate,
+        }
+    }
+
+    /// Returns the produced event times and the last time of the clock
+    fn simulate(stages: Vec<script::Stage>) -> (Vec<f64>, f64) {
+        let start = Instant::now();
+        let mut schedule = SteppedRateSchedule::new(start, stages);
+        let mut now = start;
+        let mut events = Vec::new();
+        while let Some(next_time) = schedule.next_event_time() {
+            let due = schedule.advance(now);
+            events.extend(iter::repeat_n((now - start).as_secs_f64(), due));
+            // it can get stuck on the < comparison if we don't do this
+            now = cmp::max(now + Duration::from_nanos(1), next_time);
+        }
+        (events, (now - start).as_secs_f64())
+    }
+
+    fn assert_times(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len(), "{actual:?} != {expected:?}");
+        for (a, e) in actual.iter().zip(expected) {
+            assert!((a - e).abs() < 1e-6, "{actual:?} != {expected:?}");
+        }
+    }
+
+    #[test]
+    fn schedule_constant_rate() {
+        let (events, end) = simulate(vec![stage("1s", 4.0)]);
+        assert_times(&events, &[0.25, 0.5, 0.75, 1.0]);
+        assert_times(&[end], &[1.0]);
+    }
+
+    #[test]
+    fn schedule_rate_zero() {
+        let (events, end) = simulate(vec![stage("1s", 2.0), stage("2s", 0.0), stage("1s", 2.0)]);
+        assert_times(&events, &[0.5, 1.0, 3.5, 4.0]);
+        assert_times(&[end], &[4.0]);
+
+        let (events, end) = simulate(vec![stage("1s", 1.0), stage("5s", 0.0)]);
+        assert_times(&events, &[1.0]);
+        assert_times(&[end], &[6.0]);
+    }
+
+    #[test]
+    fn schedule_short_slow_stages() {
+        let (events, _) = simulate((0..4).map(|_| stage("1s", 0.5)).collect());
+        assert_times(&events, &[2.0, 4.0]);
+
+        let (events, _) = simulate(vec![stage("1s", 0.5), stage("1s", 2.0)]);
+        assert_times(&events, &[1.25, 1.75]);
+    }
+
+    #[test]
+    fn schedule_ramp_does_not_lose_events() {
+        let (events, end) = simulate((1..=100).map(|r| stage("100ms", r as f64)).collect());
+        assert!(events.len().abs_diff(505) <= 1, "{}", events.len());
+        assert_times(&[end], &[10.0]);
     }
 
     #[test]
