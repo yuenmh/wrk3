@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{Context as _, anyhow, bail};
 use clap::{ArgAction, Parser};
-use crossbeam::atomic::AtomicCell;
+use crossbeam::{atomic::AtomicCell, queue::ArrayQueue};
 use futures::{FutureExt as _, StreamExt as _};
 use http_body_util::BodyExt;
 use hyper::Request;
@@ -83,10 +83,6 @@ struct RunCmd {
     /// Number of connections to use if using HTTP/2. Defaults to the number of VUs
     #[clap(long)]
     http2_pool: Option<usize>,
-
-    /// Number of times to attempt dispatching each iteration to the pool of VUs
-    #[clap(long, default_value_t = 8)]
-    dispatch_attempts: usize,
 
     /// Args that will be passed to the script
     #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -588,6 +584,7 @@ struct IterationInfo {
     scheduled_duration_since_start: Duration,
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn vu_loop(
     args: Arc<FxHashMap<String, String>>,
     script: Arc<Script>,
@@ -595,6 +592,8 @@ async fn vu_loop(
     metrics: mpsc::UnboundedSender<DataPoint>,
     start_time: Arc<AtomicCell<Instant>>,
     mut start_signal: impl Stream<Item = IterationInfo> + Unpin,
+    vu_idx: usize,
+    idle_vus: Arc<ArrayQueue<usize>>,
 ) -> anyhow::Result<()> {
     let state = VuState::new(
         args,
@@ -635,6 +634,10 @@ async fn vu_loop(
             "wrk3.vu_inactive",
             duration = Dt(inactive_time.into())
         ))?;
+
+        idle_vus
+            .push(vu_idx)
+            .expect("a vu is only in the idle queue once");
     }
 
     Ok(())
@@ -873,6 +876,7 @@ impl ConnectionPool for H2Pool {
 struct VuPool {
     start_time: Arc<AtomicCell<Instant>>,
     input_channels: Vec<mpsc::Sender<IterationInfo>>,
+    idle_vus: Arc<ArrayQueue<usize>>,
     vu_handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
@@ -892,6 +896,7 @@ impl VuPool {
         let start_time = global_state.start_time.clone();
         let mut input_channels = Vec::new();
         let mut vu_handles = Vec::new();
+        let idle_vus = Arc::new(ArrayQueue::new(num.max(1)));
 
         let mut started_signals = Vec::new();
 
@@ -904,6 +909,7 @@ impl VuPool {
             let metrics = global_state.metrics.clone();
             let start_time = start_time.clone();
             let connection_pool = connection_pool.clone();
+            let idle_vus = idle_vus.clone();
 
             let (vu_signal_tx, vu_signal_rx) = oneshot::channel();
             let (reactor_signal_tx, reactor_signal_rx) = oneshot::channel();
@@ -927,6 +933,8 @@ impl VuPool {
                                 metrics,
                                 start_time,
                                 ReceiverStream::new(input_rx),
+                                vu_idx,
+                                idle_vus,
                             )
                             .await
                         }
@@ -963,9 +971,16 @@ impl VuPool {
         }
         tracing::trace!("all vus spawned");
 
+        for vu_idx in 0..num {
+            idle_vus
+                .push(vu_idx)
+                .expect("idle queue has room for every vu");
+        }
+
         VuPool {
             start_time,
             input_channels,
+            idle_vus,
             vu_handles,
         }
     }
@@ -982,8 +997,8 @@ impl VuPool {
         Ok(())
     }
 
-    fn count(&self) -> usize {
-        self.input_channels.len()
+    fn take_idle_vu(&self) -> Option<usize> {
+        self.idle_vus.pop()
     }
 
     fn start_iteration(&self, vu_idx: usize, info: IterationInfo) -> Result<(), StartError> {
@@ -994,7 +1009,7 @@ impl VuPool {
 
         match tx.try_send(info) {
             Ok(_) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(StartError::Occupied),
+            Err(TrySendError::Full(_)) => unreachable!("iterations are only sent to idle vus"),
             Err(TrySendError::Closed(_)) => Err(StartError::Failed),
         }
     }
@@ -1009,47 +1024,21 @@ trait Dispatcher {
     fn dispatch_iteration(&mut self, pool: &VuPool, info: IterationInfo) -> Result<DispatchOk, ()>;
 }
 
-#[derive(Default)]
-struct RoundRobinDispatcher {
-    next: usize,
-}
+struct IdleVuDispatcher;
 
-impl Dispatcher for RoundRobinDispatcher {
+impl Dispatcher for IdleVuDispatcher {
     fn dispatch_iteration(&mut self, pool: &VuPool, info: IterationInfo) -> Result<DispatchOk, ()> {
-        let res = match pool.start_iteration(self.next, info) {
-            Ok(_) => Ok(DispatchOk::Started),
-            Err(StartError::Occupied) => Ok(DispatchOk::Skip),
-            Err(StartError::Failed) => Err(()),
+        let Some(vu_idx) = pool.take_idle_vu() else {
+            return Ok(DispatchOk::Skip);
         };
-        self.next = (self.next + 1).rem_euclid(pool.count());
-        res
-    }
-}
-
-struct RetryDispatcher<D> {
-    inner: D,
-    max_iters: usize,
-}
-
-impl<D> Dispatcher for RetryDispatcher<D>
-where
-    D: Dispatcher,
-{
-    fn dispatch_iteration(&mut self, pool: &VuPool, info: IterationInfo) -> Result<DispatchOk, ()> {
-        for _ in 0..self.max_iters {
-            if matches!(
-                self.inner.dispatch_iteration(pool, info.clone())?,
-                DispatchOk::Started
-            ) {
-                return Ok(DispatchOk::Started);
-            }
+        match pool.start_iteration(vu_idx, info) {
+            Ok(_) => Ok(DispatchOk::Started),
+            Err(StartError::Failed) => Err(()),
         }
-        Ok(DispatchOk::Skip)
     }
 }
 
 enum StartError {
-    Occupied,
     Failed,
 }
 
@@ -1379,10 +1368,7 @@ fn run_cmd(cli: RunCmd) -> anyhow::Result<()> {
                 let schedule_res = run_schedule(
                     start_time,
                     SteppedRateSchedule::new(start_time, config.stages),
-                    RetryDispatcher {
-                        inner: RoundRobinDispatcher::default(),
-                        max_iters: cli.dispatch_attempts,
-                    },
+                    IdleVuDispatcher,
                     &pool,
                     metrics_tx,
                 )
