@@ -18,7 +18,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use http_body_util::BodyExt;
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use indicatif::ProgressStyle;
+use indicatif::{ProgressState, ProgressStyle};
 use rustc_hash::FxHashMap;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt, BufWriter},
@@ -997,6 +997,12 @@ impl VuPool {
         Ok(())
     }
 
+    fn active_vus_getter(&self) -> impl Fn() -> usize + Clone + Send + Sync + 'static {
+        let total = self.input_channels.len();
+        let idle_vus = self.idle_vus.clone();
+        move || total - idle_vus.len()
+    }
+
     fn take_idle_vu(&self) -> Option<usize> {
         self.idle_vus.pop()
     }
@@ -1359,10 +1365,20 @@ fn run_cmd(cli: RunCmd) -> anyhow::Result<()> {
                 let start_time = Instant::now();
                 pool.set_start_time(start_time);
 
+                let active_vus = pool.active_vus_getter();
+                let total_vus = cli.vus;
                 Span::current().pb_set_style(
-                    &ProgressStyle::with_template("[{elapsed_precise}] [{bar:50}] {percent}%")
-                        .expect("template should be valid")
-                        .progress_chars("=> "),
+                    &ProgressStyle::with_template(
+                        "[{elapsed_precise}] [{bar:50}] {percent}% ({active_vus} VUs)",
+                    )
+                    .expect("template should be valid")
+                    .with_key(
+                        "active_vus",
+                        move |_: &ProgressState, w: &mut dyn std::fmt::Write| {
+                            let _ = write!(w, "{}/{total_vus}", active_vus());
+                        },
+                    )
+                    .progress_chars("=> "),
                 );
 
                 let schedule_res = run_schedule(
