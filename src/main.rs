@@ -8,7 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, anyhow, bail};
@@ -1370,7 +1370,16 @@ fn run_cmd(cli: RunCmd) -> anyhow::Result<()> {
         tokio::spawn(
             async move {
                 let start_time = Instant::now();
+                let start_unix = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time should be after unix epoch");
                 pool.set_start_time(start_time);
+
+                metrics_tx.send(data_point!(
+                    Duration::ZERO,
+                    "wrk3.run_started",
+                    unix = Dt(start_unix.into())
+                ))?;
 
                 let active_vus = pool.active_vus_getter();
                 let total_vus = cli.vus;
