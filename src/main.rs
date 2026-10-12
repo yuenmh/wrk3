@@ -177,9 +177,9 @@ fn negated_flag_name(name: &str) -> String {
         .unwrap_or_else(|| format!("no-{name}"))
 }
 
-fn script_arg_schema(script: &str) -> anyhow::Result<Vec<ExpectedArg>> {
+fn script_arg_schema(source: NamedSource) -> anyhow::Result<Vec<ExpectedArg>> {
     let mut seen = rustc_hash::FxHashSet::default();
-    Ok(trace_args(script)?
+    Ok(trace_args(source)?
         .into_iter()
         .filter(|param| seen.insert(param.name.clone()))
         .collect())
@@ -239,12 +239,11 @@ fn script_args_from_matches(
 }
 
 fn parse_script_args(
-    script_path: &str,
-    script: &str,
+    source: NamedSource,
     args: &Vec<String>,
 ) -> anyhow::Result<FxHashMap<String, String>> {
-    let param_schema = script_arg_schema(script)?;
-    let matches = script_args_command(script_path, &param_schema).get_matches_from(args);
+    let param_schema = script_arg_schema(source)?;
+    let matches = script_args_command(source.name(), &param_schema).get_matches_from(args);
     Ok(script_args_from_matches(&param_schema, &matches))
 }
 
@@ -576,6 +575,13 @@ async fn collect_data_points_json_file(
 struct Script {
     name: String,
     source: String,
+    parent_dir: PathBuf,
+}
+
+fn script_parent_dir(script_path: &Path) -> anyhow::Result<PathBuf> {
+    let abs = std::path::absolute(script_path)
+        .with_context(|| format!("resolving path of {}", script_path.display()))?;
+    Ok(abs.parent().map(Path::to_path_buf).unwrap_or(abs))
 }
 
 #[derive(Clone)]
@@ -597,7 +603,7 @@ async fn vu_loop(
 ) -> anyhow::Result<()> {
     let state = VuState::new(
         args,
-        NamedSource::new(&script.name, &script.source),
+        NamedSource::new(&script.name, &script.source).with_parent_dir(&script.parent_dir),
         RuntimeState {
             sender,
             metrics: metrics.clone(),
@@ -1277,8 +1283,10 @@ fn run_cmd(cli: RunCmd) -> anyhow::Result<()> {
         std::fs::read_to_string(&cli.script).with_context(|| OpenFile(cli.script.clone()))?;
 
     let script_name = cli.script.to_string_lossy().to_string();
+    let parent_dir = script_parent_dir(&cli.script)?;
+    let source = NamedSource::new(&script_name, &script).with_parent_dir(&parent_dir);
 
-    let args = parse_script_args(&script_name, &script, &cli.trailing)?;
+    let args = parse_script_args(source, &cli.trailing)?;
 
     println!("{}", banner());
 
@@ -1293,10 +1301,7 @@ fn run_cmd(cli: RunCmd) -> anyhow::Result<()> {
         println!();
     }
 
-    let config = load_config(
-        Arc::new(args.clone()),
-        NamedSource::new(&script_name, &script),
-    )?;
+    let config = load_config(Arc::new(args.clone()), source)?;
     if !config.stages.is_empty() {
         println!("Schedule:");
         for stage in &config.stages {
@@ -1339,6 +1344,7 @@ fn run_cmd(cli: RunCmd) -> anyhow::Result<()> {
                 Arc::new(Script {
                     name: script_name,
                     source: script,
+                    parent_dir,
                 }),
             )
             .await
@@ -1355,6 +1361,7 @@ fn run_cmd(cli: RunCmd) -> anyhow::Result<()> {
                 Arc::new(Script {
                     name: script_name,
                     source: script,
+                    parent_dir,
                 }),
             )
             .await
@@ -1452,20 +1459,17 @@ fn request_cmd(cli: RequestCmd) -> anyhow::Result<()> {
         std::fs::read_to_string(&cli.script).with_context(|| OpenFile(cli.script.clone()))?;
 
     let script_name = cli.script.to_string_lossy().to_string();
+    let parent_dir = script_parent_dir(&cli.script)?;
+    let source = NamedSource::new(&script_name, &script).with_parent_dir(&parent_dir);
 
-    let args = parse_script_args(&script_name, &script, &cli.trailing)?;
+    let args = parse_script_args(source, &cli.trailing)?;
 
     let addr = resolve_connectable_address(&cli.host)
         .ok_or_else(|| anyhow!("failed to resolve address {}", cli.host))?;
     println!("* Resolved {} to {}", cli.host, addr);
 
     create_runtime()?.block_on(async {
-        let first_msg = get_first_msg(
-            Arc::new(args),
-            NamedSource::new(&script_name, &script),
-            cli.seed,
-        )
-        .await?;
+        let first_msg = get_first_msg(Arc::new(args), source, cli.seed).await?;
 
         let request = match first_msg {
             RuntimeMsg::Request { request, .. } => request,
@@ -1551,7 +1555,7 @@ mod tests {
     ";
 
     fn try_parse(args: &[&str]) -> Result<FxHashMap<String, String>, clap::Error> {
-        let schema = script_arg_schema(SCRIPT).unwrap();
+        let schema = script_arg_schema(NamedSource::new("test.lua", SCRIPT)).unwrap();
         let matches = script_args_command("test.lua", &schema).try_get_matches_from(args)?;
         Ok(script_args_from_matches(&schema, &matches))
     }

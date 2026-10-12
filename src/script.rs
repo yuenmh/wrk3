@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     fmt::{Debug, Display},
     num::{ParseFloatError, ParseIntError},
+    path::Path,
     str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -666,11 +667,29 @@ fn create_wrk3_mod(lua: &mlua::Lua, state: Wrk3State) -> mlua::Result<mlua::Valu
 pub struct NamedSource<'a> {
     name: &'a str,
     code: &'a str,
+    parent_dir: Option<&'a Path>,
 }
 
 impl<'a> NamedSource<'a> {
     pub fn new(name: &'a str, code: &'a str) -> Self {
-        Self { name, code }
+        Self {
+            name,
+            code,
+            parent_dir: None,
+        }
+    }
+
+    /// Set the parent directory of the script so that modules adjacent to the entry point script
+    /// can be loaded
+    pub fn with_parent_dir(self, parent_dir: &'a Path) -> Self {
+        Self {
+            parent_dir: Some(parent_dir),
+            ..self
+        }
+    }
+
+    pub fn name(&self) -> &'a str {
+        self.name
     }
 }
 
@@ -688,13 +707,20 @@ impl mlua::chunk::AsChunk for NamedSource<'_> {
     }
 }
 
-pub fn create_lua(state: Wrk3State) -> mlua::Result<mlua::Lua> {
+pub fn create_lua(state: Wrk3State, parent_dir: Option<&Path>) -> mlua::Result<mlua::Lua> {
     let lua = mlua::Lua::new();
     lua.register_module("wrk3", create_wrk3_mod(&lua, state)?)?;
+    if let Some(dir) = parent_dir {
+        let package = lua.globals().get::<mlua::Table>("package")?;
+        let path = package.get::<String>("path")?;
+        let dir = dir.display();
+        // NOTE: not escsaped. Hopefully we aren't using paths with ; or ? in them
+        package.set("path", format!("{dir}/?.lua;{dir}/?/init.lua;{path}",))?;
+    }
     Ok(lua)
 }
 
-pub fn trace_args(script: &str) -> mlua::Result<Vec<ExpectedArg>> {
+pub fn trace_args(source: NamedSource) -> mlua::Result<Vec<ExpectedArg>> {
     let expected_args = Arc::new(Mutex::new(Vec::new()));
 
     let module = Wrk3State {
@@ -708,9 +734,9 @@ pub fn trace_args(script: &str) -> mlua::Result<Vec<ExpectedArg>> {
         },
     };
 
-    let lua = create_lua(module)?;
+    let lua = create_lua(module, source.parent_dir)?;
     // tracing the args involves supplying dummy values. therefore the script might fail, but we don't care
-    let _ = lua.load(script).exec();
+    let _ = lua.load(source).exec();
 
     Ok(std::mem::take(&mut expected_args.lock().unwrap()))
 }
@@ -751,14 +777,17 @@ struct MetricSchema {
 impl_from_lua_table!(MetricSchema, name, cols,);
 
 pub fn load_config(args: ArgsMap, source: NamedSource) -> mlua::Result<WorkloadConfig> {
-    let lua = create_lua(Wrk3State {
-        args_state: ArgsState::Runtime { args },
-        runtime_state: RuntimeState {
-            sender: mpsc::channel(1).0,
-            metrics: mpsc::unbounded_channel().0,
-            start_time: Arc::new(AtomicCell::new(Instant::now())),
+    let lua = create_lua(
+        Wrk3State {
+            args_state: ArgsState::Runtime { args },
+            runtime_state: RuntimeState {
+                sender: mpsc::channel(1).0,
+                metrics: mpsc::unbounded_channel().0,
+                start_time: Arc::new(AtomicCell::new(Instant::now())),
+            },
         },
-    })?;
+        source.parent_dir,
+    )?;
 
     struct ModuleResult {
         config: WorkloadConfig,
@@ -792,10 +821,13 @@ impl mlua::UserData for MainCtx {
 
 impl VuState {
     pub fn new(args: ArgsMap, source: NamedSource, state: RuntimeState) -> mlua::Result<Self> {
-        let lua = create_lua(Wrk3State {
-            args_state: ArgsState::Runtime { args },
-            runtime_state: state,
-        })?;
+        let lua = create_lua(
+            Wrk3State {
+                args_state: ArgsState::Runtime { args },
+                runtime_state: state,
+            },
+            source.parent_dir,
+        )?;
 
         struct ModuleResult {
             main: mlua::Function,
@@ -833,16 +865,19 @@ mod tests {
     use super::*;
 
     fn run_script(src: &str) {
-        let lua = create_lua(Wrk3State {
-            args_state: ArgsState::Runtime {
-                args: Default::default(),
+        let lua = create_lua(
+            Wrk3State {
+                args_state: ArgsState::Runtime {
+                    args: Default::default(),
+                },
+                runtime_state: RuntimeState {
+                    sender: mpsc::channel(1).0,
+                    metrics: mpsc::unbounded_channel().0,
+                    start_time: Arc::new(AtomicCell::new(Instant::now())),
+                },
             },
-            runtime_state: RuntimeState {
-                sender: mpsc::channel(1).0,
-                metrics: mpsc::unbounded_channel().0,
-                start_time: Arc::new(AtomicCell::new(Instant::now())),
-            },
-        })
+            None,
+        )
         .unwrap();
         lua.load(src).exec().unwrap();
     }
@@ -860,14 +895,17 @@ mod tests {
 
     #[test]
     fn traces_args() {
-        let args = trace_args(indoc!(
-            "
-            local w = require 'wrk3'
+        let args = trace_args(NamedSource::new(
+            "input.lua",
+            indoc!(
+                "
+                local w = require 'wrk3'
 
-            w.args.int 'foo'
-            w.args.string('bar', { default = 'default value' })
-            w.args.dt('a', { default = '10s' })
-            "
+                w.args.int 'foo'
+                w.args.string('bar', { default = 'default value' })
+                w.args.dt('a', { default = '10s' })
+                "
+            ),
         ))
         .unwrap();
         insta::assert_debug_snapshot!(args, @r#"
